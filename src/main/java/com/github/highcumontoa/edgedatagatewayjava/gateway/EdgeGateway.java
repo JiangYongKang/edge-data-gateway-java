@@ -1,0 +1,224 @@
+package com.github.highcumontoa.edgedatagatewayjava.gateway;
+
+import com.github.highcumontoa.edgedatagatewayjava.buffer.AcceptResult;
+import com.github.highcumontoa.edgedatagatewayjava.buffer.BufferStateStore;
+import com.github.highcumontoa.edgedatagatewayjava.buffer.SpoolBuffer;
+import com.github.highcumontoa.edgedatagatewayjava.collect.CollectionListener;
+import com.github.highcumontoa.edgedatagatewayjava.collect.CollectorSupervisor;
+import com.github.highcumontoa.edgedatagatewayjava.collect.DeviceStats;
+import com.github.highcumontoa.edgedatagatewayjava.config.GatewayProperties;
+import com.github.highcumontoa.edgedatagatewayjava.device.SimulatedDevice;
+import com.github.highcumontoa.edgedatagatewayjava.forward.ForwardListener;
+import com.github.highcumontoa.edgedatagatewayjava.forward.ForwardWorker;
+import com.github.highcumontoa.edgedatagatewayjava.model.NormalizedRecord;
+import com.github.highcumontoa.edgedatagatewayjava.model.OverflowPolicy;
+import com.github.highcumontoa.edgedatagatewayjava.model.PointDefinition;
+import com.github.highcumontoa.edgedatagatewayjava.model.RawReading;
+import com.github.highcumontoa.edgedatagatewayjava.model.RejectReason;
+import com.github.highcumontoa.edgedatagatewayjava.model.RejectedReading;
+import com.github.highcumontoa.edgedatagatewayjava.normalize.Normalizer;
+import com.github.highcumontoa.edgedatagatewayjava.stats.Counters;
+import com.github.highcumontoa.edgedatagatewayjava.uplink.UplinkChannel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 边缘采集网关：组装采集调度、归一化、断网缓冲与顺序补传。
+ *
+ * <p>一致性要点：
+ * <ul>
+ *   <li>所有通过校验的记录先落缓冲（WAL + 位点状态持久化），再触发补传；
+ *       重启后从已确认位点恢复，已确认数据不丢、未确认数据按序重放。</li>
+ *   <li>每设备时间戳单调（允许相等，严格回退才拒绝）；位点状态持久化最后时间戳，
+ *       重启后不会从错误时间点继续。</li>
+ *   <li>畸形读数只带原因拒绝并计数，绝不静默丢弃或写入脏值。</li>
+ * </ul>
+ */
+public final class EdgeGateway implements CollectionListener, ForwardListener {
+
+    private static final Logger log = LoggerFactory.getLogger(EdgeGateway.class);
+
+    private final GatewayProperties props;
+    private final SpoolBuffer buffer;
+    private final Normalizer normalizer;
+    private final CollectorSupervisor supervisor;
+    private final ForwardWorker forwarder;
+    private final Counters counters;
+    private final UplinkChannel channel;
+
+    public EdgeGateway(GatewayProperties props,
+                       List<SimulatedDevice> devices,
+                       UplinkChannel channel) throws IOException {
+        this.props = props;
+        this.channel = channel;
+        Path dir = props.dataDir();
+        Files.createDirectories(dir);
+        this.buffer = new SpoolBuffer(
+                new BufferStateStore.JsonFile(dir.resolve("buffer-state.json")),
+                dir.resolve("spool.wal"),
+                props.bufferCapacity(),
+                props.overflowPolicy());
+        buffer.recover();
+        log.info("buffer recovered: nextSeq={}, confirmedSeq={}, pending={}",
+                buffer.nextSeq(), buffer.confirmedSeq(), buffer.size());
+
+        Map<String, PointDefinition> catalog = buildCatalog(devices);
+        this.normalizer = new Normalizer(catalog);
+        this.counters = new Counters();
+        this.supervisor = new CollectorSupervisor(devices, normalizer, catalog, this,
+                props.collectIntervalMillis());
+        this.forwarder = new ForwardWorker(buffer, channel, this,
+                props.drainIntervalMillis(), props.batchSize());
+    }
+
+    public void start() {
+        forwarder.start();
+        supervisor.start();
+        log.info("edge gateway started: {}", props);
+    }
+
+    public void shutdown() {
+        // 先停采集，再停补传，关闭期间不再有新 append
+        supervisor.stop();
+        forwarder.stop();
+        log.info("edge gateway stopped");
+    }
+
+    public SpoolBuffer buffer() {
+        return buffer;
+    }
+
+    public Counters counters() {
+        return counters;
+    }
+
+    public UplinkChannel channel() {
+        return channel;
+    }
+
+    public Map<String, DeviceStats> deviceStats() {
+        return supervisor.snapshot();
+    }
+
+    public GatewaySnapshot snapshot() {
+        return new GatewaySnapshot(
+                System.currentTimeMillis(),
+                channel.connected(),
+                buffer.nextSeq(),
+                buffer.confirmedSeq(),
+                buffer.size(),
+                counters.polled(),
+                counters.accepted(),
+                counters.delivered(),
+                counters.dropped(),
+                counters.rejectedByReason(),
+                supervisor.snapshot());
+    }
+
+    // ---- CollectionListener（在各设备自己的采集线程上回调，缓冲自身线程安全）----
+
+    @Override
+    public void onPolled(String deviceId) {
+        counters.incrementPolled();
+    }
+
+    @Override
+    public void onAccepted(String deviceId, RawReading raw, NormalizedRecord record) {
+        Long lastTs = buffer.lastTimestamp(deviceId);
+        if (lastTs != null && raw.timestamp() < lastTs) {
+            RejectedReading rr = new RejectedReading(raw, RejectReason.TIMESTAMP_OUT_OF_ORDER,
+                    "timestamp " + raw.timestamp() + " < lastAccepted " + lastTs
+                            + " for device " + deviceId);
+            counters.incrementRejected(RejectReason.TIMESTAMP_OUT_OF_ORDER);
+            log.warn("[REJECT] raw={} reason={} detail={}", raw, rr.reason(), rr.detail());
+            return;
+        }
+
+        AcceptResult result = buffer.append(record);
+        if (!result.accepted()) {
+            // REJECT_NEWEST：缓冲满，新记录被确定性拒绝；seq 已消耗，形成可解释缺口
+            counters.addDropped(1);
+            log.warn("[BUFFER-FULL REJECT-NEWEST] raw={} normalized(seq={}) dropped, "
+                            + "policy={}, capacity={}, confirmedSeq={}",
+                    raw, result.seq(), props.overflowPolicy(), props.bufferCapacity(),
+                    buffer.confirmedSeq());
+            return;
+        }
+
+        counters.incrementAccepted();
+        NormalizedRecord stored = new NormalizedRecord(result.seq(), record.deviceId(),
+                record.pointId(), record.type(), record.value(), record.unit(), record.timestamp());
+        log.info("[ACCEPT] raw={} -> normalized={}", raw, stored);
+        if (!result.dropped().isEmpty()) {
+            counters.addDropped(result.dropped().size());
+            result.dropped().forEach(v -> log.warn(
+                    "[BUFFER-FULL DROP-OLDEST] evicted seq={} {}/{} ts={} to make room for seq={}",
+                    v.seq(), v.deviceId(), v.pointId(), v.timestamp(), result.seq()));
+        }
+        forwarder.kick();
+    }
+
+    @Override
+    public void onRejected(String deviceId, RejectedReading rejected) {
+        counters.incrementRejected(rejected.reason());
+        log.warn("[REJECT] raw={} reason={} detail={}",
+                rejected.raw(), rejected.reason(), rejected.detail());
+    }
+
+    @Override
+    public void onDeviceError(String deviceId, Throwable error) {
+        log.warn("[DEVICE-ERROR] device={} error={}", deviceId, error.toString());
+    }
+
+    @Override
+    public void onOnlineState(String deviceId, boolean online) {
+        log.info("[DEVICE] device={} online={}", deviceId, online);
+    }
+
+    // ---- ForwardListener ----
+
+    @Override
+    public void onConfirmed(long confirmedSeq, int recordsThisBatch) {
+        counters.incrementDelivered(recordsThisBatch);
+        log.info("[FORWARD] confirmedSeq={} (+{} records), nextSeq={}, pending={}",
+                confirmedSeq, recordsThisBatch, buffer.nextSeq(), buffer.size());
+    }
+
+    @Override
+    public void onUplinkDown(Throwable error) {
+        log.warn("[UPLINK] down: {} — records spool locally, confirmedSeq={}, pending={}",
+                error.toString(), buffer.confirmedSeq(), buffer.size());
+    }
+
+    @Override
+    public void onUplinkUp() {
+        log.info("[UPLINK] up — resume forwarding from confirmedSeq={}, pending={}",
+                buffer.confirmedSeq(), buffer.size());
+    }
+
+    static Map<String, PointDefinition> buildCatalog(List<SimulatedDevice> devices) {
+        Map<String, PointDefinition> catalog = new LinkedHashMap<>();
+        for (SimulatedDevice d : devices) {
+            for (PointDefinition p : d.points()) {
+                String key = Normalizer.catalogKey(d.deviceId(), p.pointId());
+                PointDefinition existing = catalog.get(key);
+                if (existing != null && !existing.equals(p)) {
+                    throw new IllegalArgumentException("conflicting point definitions for " + key);
+                }
+                catalog.put(key, p);
+            }
+        }
+        return Map.copyOf(catalog);
+    }
+
+    /** 溢出策略在日志中的引用（便于文档与代码对齐）。 */
+    @SuppressWarnings("unused")
+    private static final OverflowPolicy DEFAULT_POLICY = OverflowPolicy.DROP_OLDEST;
+}
