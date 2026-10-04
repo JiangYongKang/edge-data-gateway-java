@@ -100,6 +100,18 @@ public final class DemoRunner {
                 + channel.delivered().stream().map(r -> r.seq() + "/" + r.deviceId()
                 + "/" + r.pointId() + "=" + r.value()).toList());
         System.out.println("[DEMO] devices: " + s.devices());
+        System.out.println("[DEMO] reconciliation consistent=" + s.reconciliation().consistent()
+                + " issues=" + s.reconciliation().issues()
+                + " (allocated nextSeq=" + s.nextSeq() + " == delivered " + s.delivered()
+                + " + dropped " + s.dropped() + " + pending " + s.pendingCount() + ")");
+        s.reconciliation().devices().forEach((id, d) -> System.out.println(
+                "[DEMO] reconcile " + id + ": health=" + d.health() + " consistent="
+                        + d.consistent() + " polled=" + d.polled() + "(ok="
+                        + d.successfulPolls() + ",fail=" + d.failedPolls() + ") received="
+                        + d.received() + "(accepted=" + d.accepted() + ",shed="
+                        + d.shedNewest() + ",rejected=" + d.rejectedTotal() + ") accepted="
+                        + d.accepted() + "(delivered=" + d.delivered() + ",droppedOldest="
+                        + d.droppedOldest() + ",pending=" + d.pending() + ")"));
     }
 
     private static RawReading raw(String device, String point, Object value,

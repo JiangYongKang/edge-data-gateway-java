@@ -1,51 +1,36 @@
 package com.github.highcumontoa.edgedatagatewayjava.collect;
 
-import com.github.highcumontoa.edgedatagatewayjava.device.ScriptedDevice;
 import com.github.highcumontoa.edgedatagatewayjava.device.SimulatedDevice;
-import com.github.highcumontoa.edgedatagatewayjava.model.NormalizeResult;
-import com.github.highcumontoa.edgedatagatewayjava.model.PointDefinition;
 import com.github.highcumontoa.edgedatagatewayjava.model.RawReading;
-import com.github.highcumontoa.edgedatagatewayjava.normalize.Normalizer;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 多设备并发采集调度。
  *
  * <p>每个设备拥有独立的单线程调度器：任何一个设备轮询异常（甚至 Error 级故障）都在
- * 该设备自己的任务内被捕获并回调 {@link CollectionListener#onDeviceError}，
- * 不会传播到调度线程或其它设备。
+ * 该设备自己的任务内被捕获并回调 {@link CollectionListener#onPollFailure}，
+ * 不会传播到调度线程或其它设备。健康判定、归一化与统计计数全部在
+ * {@link CollectionListener}（网关）一侧、于网关一致性写锁内完成。
  */
 public final class CollectorSupervisor {
 
     private final List<SimulatedDevice> devices;
-    private final Normalizer normalizer;
     private final CollectionListener listener;
     private final long intervalMillis;
-    private final Map<String, DeviceRuntime> runtimes = new LinkedHashMap<>();
     private final List<ScheduledExecutorService> executors = new ArrayList<>();
 
     public CollectorSupervisor(List<SimulatedDevice> devices,
-                               Normalizer normalizer,
-                               Map<String, PointDefinition> catalog,
                                CollectionListener listener,
                                long intervalMillis) {
         this.devices = List.copyOf(devices);
-        this.normalizer = normalizer;
         this.listener = listener;
         this.intervalMillis = intervalMillis;
-        for (SimulatedDevice d : devices) {
-            runtimes.put(d.deviceId(), new DeviceRuntime(d.deviceId(),
-                    d.online() ? DeviceStatus.UP : DeviceStatus.DOWN));
-        }
     }
 
     public void start() {
@@ -74,82 +59,17 @@ public final class CollectorSupervisor {
     }
 
     private void safePoll(SimulatedDevice device) {
-        DeviceRuntime rt = runtimes.get(device.deviceId());
-        rt.pollCount.incrementAndGet();
-        rt.lastPollAt = System.currentTimeMillis();
-        listener.onPolled(device.deviceId());
+        String deviceId = device.deviceId();
+        listener.onPollBegin(deviceId, System.currentTimeMillis());
         List<RawReading> readings;
         try {
             readings = device.poll();
         } catch (Throwable t) {
-            // 捕获 Throwable：单设备的任何故障都不得影响调度器和其它设备
-            rt.errorCount.incrementAndGet();
-            rt.lastErrorAt = System.currentTimeMillis();
-            rt.lastError = String.valueOf(t);
-            listener.onDeviceError(device.deviceId(), t);
-            updateOnline(rt, false);
+            // 捕获 Throwable：单设备的任何故障都不得影响调度器和其它设备；
+            // 这是本设备真实的失败，参与健康降级判定（与上行通道无关）。
+            listener.onPollFailure(deviceId, t, System.currentTimeMillis());
             return;
         }
-        updateOnline(rt, true);
-        for (RawReading raw : readings) {
-            NormalizeResult result;
-            try {
-                result = normalizer.normalize(raw);
-            } catch (Throwable t) {
-                // 归一化内部不应抛出；万一抛出，按设备错误处理而不是静默丢弃
-                rt.errorCount.incrementAndGet();
-                rt.lastErrorAt = System.currentTimeMillis();
-                rt.lastError = String.valueOf(t);
-                listener.onDeviceError(device.deviceId(), t);
-                continue;
-            }
-            if (result.accepted()) {
-                rt.acceptedCount.incrementAndGet();
-                listener.onAccepted(device.deviceId(), raw, result.record());
-            } else {
-                rt.rejectedCount.incrementAndGet();
-                listener.onRejected(device.deviceId(), result.rejected());
-            }
-        }
+        listener.onPollSuccess(deviceId, readings, System.currentTimeMillis());
     }
-
-    private void updateOnline(DeviceRuntime rt, boolean online) {
-        DeviceStatus next = online ? DeviceStatus.UP : DeviceStatus.DOWN;
-        if (rt.status != next) {
-            rt.status = next;
-            listener.onOnlineState(rt.deviceId, online);
-        }
-    }
-
-    public Map<String, DeviceStats> snapshot() {
-        Map<String, DeviceStats> out = new LinkedHashMap<>();
-        runtimes.forEach((id, rt) -> out.put(id, new DeviceStats(
-                id, rt.status,
-                rt.pollCount.get(), rt.errorCount.get(),
-                rt.acceptedCount.get(), rt.rejectedCount.get(),
-                rt.lastPollAt, rt.lastErrorAt, rt.lastError)));
-        return out;
-    }
-
-    /** 单设备运行时统计（可变，仅被该设备自己的采集线程写，读线程看到快照一致值）。 */
-    private static final class DeviceRuntime {
-        final String deviceId;
-        volatile DeviceStatus status;
-        final AtomicLong pollCount = new AtomicLong();
-        final AtomicLong errorCount = new AtomicLong();
-        final AtomicLong acceptedCount = new AtomicLong();
-        final AtomicLong rejectedCount = new AtomicLong();
-        volatile Long lastPollAt = null;
-        volatile Long lastErrorAt = null;
-        volatile String lastError = null;
-
-        DeviceRuntime(String deviceId, DeviceStatus initial) {
-            this.deviceId = deviceId;
-            this.status = initial;
-        }
-    }
-
-    /** 保留设备异常类型引用以便上层按类型区分日志。 */
-    @SuppressWarnings("unused")
-    private static final Class<?> DEVICE_UNAVAILABLE = ScriptedDevice.DeviceUnavailableException.class;
 }

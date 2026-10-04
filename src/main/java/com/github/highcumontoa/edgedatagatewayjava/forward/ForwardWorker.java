@@ -124,23 +124,15 @@ public final class ForwardWorker {
             }
             return false;
         }
-        // 只确认本批真正覆盖的 seq 范围（防御性：不能确认超出本批最大 seq 的位点）
+        // 确认位点 + 按设备归属计数由网关在同一把写锁内原子完成，避免并发下计数自相矛盾
         long maxBatchSeq = batch.get(batch.size() - 1).seq();
         long toConfirm = Math.min(ackSeq, maxBatchSeq);
-        boolean advanced = buffer.confirm(toConfirm);
+        boolean advanced = listener.onConfirmed(batch, toConfirm);
         if (down) {
             down = false;
             listener.onUplinkUp();
         }
         if (advanced) {
-            // 统计本批中实际完成投递的条数（低于等于新位点、且高于旧位点）
-            int n = 0;
-            for (NormalizedRecord r : batch) {
-                if (r.seq() <= toConfirm) {
-                    n++;
-                }
-            }
-            listener.onConfirmed(toConfirm, n);
             // 成功且位点推进：若还有积压继续排空
             return true;
         }

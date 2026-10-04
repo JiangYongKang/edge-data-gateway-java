@@ -38,7 +38,7 @@ class ForwardWorkerTest {
         SpoolBuffer buf = newBuffer(dir.resolve("case1"));
         buf.recover();
         MockUplinkChannel channel = new MockUplinkChannel(false); // 启动即断网
-        CountingListener listener = new CountingListener();
+        CountingListener listener = new CountingListener(buf);
         ForwardWorker worker = new ForwardWorker(buf, channel, listener, 20L, 100);
         worker.start();
 
@@ -74,7 +74,7 @@ class ForwardWorkerTest {
         SpoolBuffer buf = newBuffer(dir.resolve("case2"));
         buf.recover();
         MockUplinkChannel channel = new MockUplinkChannel(true);
-        CountingListener listener = new CountingListener();
+        CountingListener listener = new CountingListener(buf);
         ForwardWorker worker = new ForwardWorker(buf, channel, listener, 20L, 100);
         worker.start();
 
@@ -150,7 +150,7 @@ class ForwardWorkerTest {
                 return true;
             }
         };
-        CountingListener l1 = new CountingListener();
+        CountingListener l1 = new CountingListener(buf);
         ForwardWorker w1 = new ForwardWorker(buf, flaky, l1, 20L, 100);
         w1.start();
         buf.append(rec(0, 100));
@@ -166,7 +166,7 @@ class ForwardWorkerTest {
         assertEquals(0L, reopened.confirmedSeq());
         assertEquals(List.of(1L), seqs(reopened.pending()));
         MockUplinkChannel channel2 = new MockUplinkChannel(false);
-        CountingListener l2 = new CountingListener();
+        CountingListener l2 = new CountingListener(reopened);
         ForwardWorker w2 = new ForwardWorker(reopened, channel2, l2, 20L, 100);
         w2.start();
         Thread.sleep(150);
@@ -206,16 +206,32 @@ class ForwardWorkerTest {
 
     /** 统计位点推进事件：onConfirmed 只应在位点真正推进时触发一次。 */
     private static final class CountingListener implements ForwardListener {
+        private final SpoolBuffer buf;
         final AtomicInteger confirmEvents = new AtomicInteger(0);
         final AtomicInteger confirmedRecords = new AtomicInteger(0);
         final AtomicInteger downEvents = new AtomicInteger(0);
         final AtomicInteger upEvents = new AtomicInteger(0);
 
+        CountingListener(SpoolBuffer buf) {
+            this.buf = buf;
+        }
+
         @Override
-        public void onConfirmed(long confirmedSeq, int recordsThisBatch) {
-            confirmEvents.incrementAndGet();
-            confirmedRecords.addAndGet(recordsThisBatch);
-            log.info("[补传位点] onConfirmed seq={} n={}", confirmedSeq, recordsThisBatch);
+        public boolean onConfirmed(List<NormalizedRecord> batch, long ackSeq) {
+            long oldConfirmed = buf.confirmedSeq();
+            boolean advanced = buf.confirm(ackSeq);
+            if (advanced) {
+                int n = 0;
+                for (NormalizedRecord r : batch) {
+                    if (r.seq() > oldConfirmed && r.seq() <= buf.confirmedSeq()) {
+                        n++;
+                    }
+                }
+                confirmEvents.incrementAndGet();
+                confirmedRecords.addAndGet(n);
+                log.info("[补传位点] onConfirmed seq={} n={}", ackSeq, n);
+            }
+            return advanced;
         }
 
         @Override
