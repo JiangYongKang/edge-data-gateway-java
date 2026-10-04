@@ -196,6 +196,17 @@ public final class SpoolBuffer {
         }
     }
 
+    /** 位点与积压的一致性视图（含逐设备积压计数），供统计核对交叉验证。 */
+    public BufferView view() {
+        synchronized (lock) {
+            Map<String, Integer> byDevice = new LinkedHashMap<>();
+            for (NormalizedRecord r : pending) {
+                byDevice.merge(r.deviceId(), 1, Integer::sum);
+            }
+            return new BufferView(nextSeq, confirmedSeq, pending.size(), byDevice);
+        }
+    }
+
     // ---- 持久化 ----
 
     private void persistState() {

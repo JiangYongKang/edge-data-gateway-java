@@ -3,21 +3,25 @@
 基于 Spring Boot 3 / Java 21 的本地模拟边缘网关：从多个模拟设备并发采集点位读数，
 归一化为统一上行记录；上行中断时本地有界缓冲，恢复后按时间顺序补传；
 对越界、乱序、类型/单位不匹配等畸形读数**只带可区分原因拒绝，绝不静默丢弃或写入脏值**。
+在此之上提供**设备健康分级**（正常/反复出错/严重故障/恢复观察）、**运行中统计一致性核对**
+（逐设备指出哪类计数对不上）与**重启后续算**（健康与统计基线衔接重启前，不清零、不重复计数）。
 
 不依赖任何外部中间件：设备与上行通道均为进程内模拟，断网/重连/设备故障均可确定性复现。
 
 ## 1. 构建与运行
 
 ```bash
-mvn test          # 23 个单测，覆盖断网重连、重复补传、畸形读数、缓冲溢出边界
+mvn test          # 33 个单测，覆盖断网重连、重复补传、畸形读数、缓冲溢出边界、
+                  # 健康分级、恢复观察、并发核对自洽、重启续算
 mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 java -cp "target/classes:$(cat target/cp.txt)" \
      com.github.highcumontoa.edgedatagatewayjava.demo.DemoRunner
 ```
 
 演示剧本（约 5 秒）：两设备并发采集 → 上行断网 2s（缓冲积压并触发 DROP_OLDEST）
-→ 恢复后顺序补传 → 一台设备掉线 1s 后恢复（另一台不受影响）。结束时打印
-最终位点、计数器与下游收到的去重记录。
+→ 恢复后顺序补传 → 一台设备掉线 1s 后恢复（另一台不受影响，且该设备经历
+DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印最终位点、计数器、
+下游去重记录、逐设备健康状态（含最近切换原因）与统计核对结论。
 
 ## 2. 模块结构
 
@@ -30,9 +34,11 @@ java -cp "target/classes:$(cat target/cp.txt)" \
 | `uplink` | `UplinkChannel` / `MockUplinkChannel` | 上行通道抽象与模拟（断网/重连、按 seq 幂等去重） |
 | `forward` | `ForwardWorker` | 单线程顺序补传，断网重试，重复投递/确认安全 |
 | `collect` | `CollectorSupervisor` | 每设备独立调度线程，异常隔离、在线状态与设备统计 |
-| `stats` | `Counters` | 全局线程安全计数 |
+| `stats` | `StatsRegistry` / `StatsSnapshot` / `DeviceCounters` / `DeviceStateStore` | 全局+逐设备计数（单锁自洽快照）、设备级状态持久化 |
+| `health` | `HealthMonitor` / `HealthState` / `DeviceHealth` | 设备健康分级状态机，只由真实轮询结果驱动 |
+| `audit` | `ConsistencyAuditor` / `AuditReport` | 运行中统计一致性核对，逐设备指出不一致类别 |
 | `gateway` | `EdgeGateway` / `GatewaySnapshot` | 编排与一致性保证 |
-| `config` | `GatewayProperties` | 数据目录、容量、溢出策略、采集/补传周期、批大小 |
+| `config` | `GatewayProperties` | 数据目录、容量、溢出策略、采集/补传周期、批大小、健康阈值 |
 | `demo` | `DemoRunner` | 本地可运行演示 + 测试用条件等待工具 |
 
 ## 3. 采集与归一化规则
@@ -112,7 +118,73 @@ java -cp "target/classes:$(cat target/cp.txt)" \
 - 上行断网不影响采集：记录继续进缓冲（满则按策略处理）。
 - 关闭顺序：先停采集、再停补传，保证关闭期间无新记录与补传竞争。
 
-## 6. 可观测性
+## 6. 设备健康分级
+
+每台设备除在线/离线（`DeviceStatus`，反映最近一次轮询是否成功）外，还有独立的
+**健康状态**（`HealthState`），只由该设备**自身真实轮询结果**驱动：
+
+| 状态 | 含义 | 进入条件 |
+|---|---|---|
+| `HEALTHY` | 正常，采集稳定 | 初始状态；或恢复观察期连续成功达到 `recoverAfterSuccesses` |
+| `DEGRADED` | 反复出错 | 连续失败 ≥ `degradeAfterFailures`；或恢复观察期内再次出错 |
+| `FAULT` | 已判定严重故障 | 连续失败 ≥ `faultAfterFailures` |
+| `RECOVERING` | 故障后恢复观察中 | DEGRADED/FAULT 后首次轮询成功；连续成功不足恢复阈值前保持 |
+
+关键语义：
+
+- **上行通道短时中断不影响健康判定**：健康输入只有 `poll()` 的成功/失败，
+  断网、缓冲溢出、补传滞后都不会把设备算成不健康（断网期间设备正常采集时
+  保持 `HEALTHY`）。
+- **恢复观察**：故障设备重新成功后先进入 `RECOVERING`，必须连续成功达到阈值
+  才回到 `HEALTHY`，避免"刚恢复一次就被当成完全正常"；观察期内再次出错立即
+  退回 `DEGRADED`，连续失败计数继续累计，达到故障阈值仍会判 `FAULT`。
+- 每次切换都记录**原因与时间**：`DeviceHealth.lastTransitionReason /
+  lastTransitionAt`，连同 `lastError / consecutiveFailures /
+  consecutiveSuccesses` 可通过 `EdgeGateway.deviceHealth()` 查询，
+  切换时打印 `[HEALTH]` 日志并立即落盘。
+- 归一化内部防御性异常（设计上不发生）计为 `internalErrors`，**不**参与健康判定。
+
+## 7. 运行中统计一致性核对
+
+`EdgeGateway.audit()` 随时返回一份 `AuditReport`（`CONSISTENT` / `INCONSISTENT`
+/ `UNSTABLE`），核对口径：
+
+| 核对项 | 关系 | 粒度 |
+|---|---|---|
+| 轮询守恒 | `polls == okPolls + pollFailures` | 逐设备 |
+| 全局=逐设备之和 | polled / accepted / delivered / droppedOldest / rejectedNewest / 各拒绝原因 | 全局 |
+| 序号守恒 | `nextSeq == accepted + rejectedNewest`（每个被接受记录消耗一个 seq，REJECT_NEWEST 也消耗一个） | 全局 |
+| 流向守恒 | `accepted == delivered + droppedOldest + pending` | 全局 + 逐设备 |
+
+发现不一致时，`violations` 逐条给出**哪台设备（全局关系为 null）、哪一类计数
+（`Category`）、期望值与实际值**，而不是笼统的失败结论。
+
+**自洽性边界**：统计快照在 `StatsRegistry` 单锁内生成，本身不会被并发写撕裂；
+与缓冲联动的计数只在缓冲 append/confirm 之后变化，因此核对器采用
+"读缓冲视图 → 读统计快照 → 再读缓冲视图，两次视图相等"的一致性切面。
+采集与补传并发进行时若切面不稳定会重试（最多 100 次）；极端持续写入下返回
+`UNSTABLE`——**绝不把不同时间点的计数拼成一份自相矛盾的报告**。
+
+## 8. 重启续算与兼容范围
+
+数据目录下有三类持久化文件，各司其职：
+
+| 文件 | 内容 | 保证 |
+|---|---|---|
+| `spool.wal` + `buffer-state.json` | 未确认记录、seq 位点、每设备最后时间戳 | 已确认数据不重放、未确认按序重放、seq 不复用 |
+| `device-state.json` | 逐设备统计基线（轮询/接受/拒绝/送达/丢弃）+ 健康状态、连续失败/成功次数、最近错误、最近切换原因与时间 | 重启后续算：不清零重算、已确认/已溢出处理的数据不再次计入 |
+
+- 落盘时机：每次健康状态切换、以及 `shutdown()` 时（临时文件 + 原子 rename）。
+- **优雅停机后重启**：健康状态（如 FAULT）、连续失败/成功次数、统计基线完整
+  衔接，继续运行后 `audit()` 仍成立；全局计数由逐设备基线求和恢复，
+  "全局=逐设备之和"天然成立。
+- **崩溃（非优雅停机）**：缓冲位点由 WAL 保证不丢不重；统计与健康状态回退到
+  最近一次落盘（最后一次健康切换或上次优雅停机），可能丢失其后的计数增量——
+  属于已声明边界，不会因此产生重复计数。
+- **旧版本数据目录升级**：`device-state.json` 缺失或字段缺失时按零基线 /
+  `HEALTHY` 处理，未知字段忽略，可直接升级。
+
+## 9. 可观测性
 
 日志标记（单测同样打印，便于核对结论）：
 
@@ -121,12 +193,15 @@ java -cp "target/classes:$(cat target/cp.txt)" \
 - `[BUFFER-FULL DROP-OLDEST|REJECT-NEWEST]`：溢出处理明细与容量、位点；
 - `[FORWARD]`：补传位点推进（confirmedSeq、本批条数、剩余 pending）；
 - `[UPLINK] down/up`：上行中断与恢复（打印恢复位点）；
-- `[DEVICE] online=true/false`、`[DEVICE-ERROR]`。
+- `[DEVICE] online=true/false`、`[DEVICE-ERROR]`；
+- `[HEALTH]`：设备健康状态切换（含原因与时间）；
+- `[INTERNAL-ERROR]`：归一化内部防御性异常（不影响健康判定）。
 
 `GatewaySnapshot` 字段：`uplinkConnected, nextSeq, confirmedSeq, pendingCount,
-polled, accepted, delivered, dropped, rejectedByReason(各原因分项), devices(逐设备)`。
+polled, accepted, delivered, dropped, rejectedByReason(各原因分项), devices(逐设备),
+health(逐设备健康)`。核对结论通过 `EdgeGateway.audit()` 获取。
 
-## 7. 测试与验证方法
+## 10. 测试与验证方法
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -134,14 +209,18 @@ polled, accepted, delivered, dropped, rejectedByReason(各原因分项), devices
 | `SpoolBufferTest`（5） | seq 单调分配、重复/回退/超前确认无效、DROP_OLDEST 与 REJECT_NEWEST 边界、WAL 重启只回放未确认、丢弃记录重启不复活 |
 | `ForwardWorkerTest`（4） | 启动即断网→重连顺序补传无缺口、8 线程并发 kick 无重复、同批重复发送幂等、Worker 重启从已确认位点续传 |
 | `GatewayIntegrationTest`（5） | 单设备异常不影响其它设备且统计如实、畸形+乱序读数原因可区分且脏值不到下游、断网溢出 DROP_OLDEST 端到端守恒、网关重启不重放已确认且 seq 连续、重启后乱序时间戳位点恢复 |
+| `HealthMonitorTest`（4） | 反复出错 HEALTHY→DEGRADED→FAULT 且切换原因/时间可查、恢复观察通过才回正常、观察期复发退回降级、重启恢复后续算不重新累计 |
+| `HealthAndAuditTest`（6） | 网关端到端：反复出错降级、上行中断不误判设备不健康、恢复观察期可观察、并发采集+断连+溢出下 300 次核对无自相矛盾、重启后健康与统计续算不重复计数、REJECT_NEWEST 序号守恒 |
 
 测试日志中可直接看到 `[原始读数]`、`[归一化结果]`、`[补传位点]` 三类打印。
 关键一致性断言：下游记录严格按 seq 升序且全局唯一；
 `已分配 seq 数 = 下游记录数 + 溢出丢弃数`；拒绝原因分项计数与注入的异常一一对应；
 逐设备 `errorCount/acceptedCount` 与故障/恢复剧本一致。
 
-## 8. 配置
+## 11. 配置
 
 `GatewayProperties(dataDir, bufferCapacity, overflowPolicy, collectIntervalMillis,
-drainIntervalMillis, batchSize)`，测试与演示直接构造；生产可由 Spring 配置绑定。
-默认值：容量 1000、`DROP_OLDEST`、采集 100ms、补传 50ms、批 100。
+drainIntervalMillis, batchSize, degradeAfterFailures, faultAfterFailures,
+recoverAfterSuccesses)`，测试与演示直接构造；生产可由 Spring 配置绑定。
+默认值：容量 1000、`DROP_OLDEST`、采集 100ms、补传 50ms、批 100、
+健康阈值 3 / 6 / 3（降级 / 故障 / 恢复观察）。旧 6 参构造器保留，健康阈值取默认值。

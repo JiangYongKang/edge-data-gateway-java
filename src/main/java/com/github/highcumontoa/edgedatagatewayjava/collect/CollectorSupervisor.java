@@ -90,17 +90,20 @@ public final class CollectorSupervisor {
             updateOnline(rt, false);
             return;
         }
+        // 真实轮询成功（空批次也算）：健康判定只认这个结果
+        listener.onPollSucceeded(device.deviceId());
         updateOnline(rt, true);
         for (RawReading raw : readings) {
             NormalizeResult result;
             try {
                 result = normalizer.normalize(raw);
             } catch (Throwable t) {
-                // 归一化内部不应抛出；万一抛出，按设备错误处理而不是静默丢弃
+                // 归一化内部不应抛出；万一抛出，计为内部错误而不是设备故障，
+                // 不影响该设备的健康判定
                 rt.errorCount.incrementAndGet();
                 rt.lastErrorAt = System.currentTimeMillis();
                 rt.lastError = String.valueOf(t);
-                listener.onDeviceError(device.deviceId(), t);
+                listener.onInternalError(device.deviceId(), raw, t);
                 continue;
             }
             if (result.accepted()) {

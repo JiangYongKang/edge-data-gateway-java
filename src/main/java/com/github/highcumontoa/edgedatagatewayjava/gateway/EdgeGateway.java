@@ -1,5 +1,7 @@
 package com.github.highcumontoa.edgedatagatewayjava.gateway;
 
+import com.github.highcumontoa.edgedatagatewayjava.audit.AuditReport;
+import com.github.highcumontoa.edgedatagatewayjava.audit.ConsistencyAuditor;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.AcceptResult;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.BufferStateStore;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.SpoolBuffer;
@@ -10,6 +12,8 @@ import com.github.highcumontoa.edgedatagatewayjava.config.GatewayProperties;
 import com.github.highcumontoa.edgedatagatewayjava.device.SimulatedDevice;
 import com.github.highcumontoa.edgedatagatewayjava.forward.ForwardListener;
 import com.github.highcumontoa.edgedatagatewayjava.forward.ForwardWorker;
+import com.github.highcumontoa.edgedatagatewayjava.health.DeviceHealth;
+import com.github.highcumontoa.edgedatagatewayjava.health.HealthMonitor;
 import com.github.highcumontoa.edgedatagatewayjava.model.NormalizedRecord;
 import com.github.highcumontoa.edgedatagatewayjava.model.OverflowPolicy;
 import com.github.highcumontoa.edgedatagatewayjava.model.PointDefinition;
@@ -17,7 +21,8 @@ import com.github.highcumontoa.edgedatagatewayjava.model.RawReading;
 import com.github.highcumontoa.edgedatagatewayjava.model.RejectReason;
 import com.github.highcumontoa.edgedatagatewayjava.model.RejectedReading;
 import com.github.highcumontoa.edgedatagatewayjava.normalize.Normalizer;
-import com.github.highcumontoa.edgedatagatewayjava.stats.Counters;
+import com.github.highcumontoa.edgedatagatewayjava.stats.DeviceStateStore;
+import com.github.highcumontoa.edgedatagatewayjava.stats.StatsRegistry;
 import com.github.highcumontoa.edgedatagatewayjava.uplink.UplinkChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,7 +35,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 边缘采集网关：组装采集调度、归一化、断网缓冲与顺序补传。
+ * 边缘采集网关：组装采集调度、归一化、断网缓冲与顺序补传，
+ * 以及设备健康分级、统计一致性核对与重启续算。
  *
  * <p>一致性要点：
  * <ul>
@@ -39,6 +45,9 @@ import java.util.Map;
  *   <li>每设备时间戳单调（允许相等，严格回退才拒绝）；位点状态持久化最后时间戳，
  *       重启后不会从错误时间点继续。</li>
  *   <li>畸形读数只带原因拒绝并计数，绝不静默丢弃或写入脏值。</li>
+ *   <li>设备健康只由真实轮询结果驱动；上行中断不参与健康判定。</li>
+ *   <li>统计与健康状态落盘（device-state.json），优雅停机后重启续算，
+ *       不清零重算、不重复计数。</li>
  * </ul>
  */
 public final class EdgeGateway implements CollectionListener, ForwardListener {
@@ -50,7 +59,10 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
     private final Normalizer normalizer;
     private final CollectorSupervisor supervisor;
     private final ForwardWorker forwarder;
-    private final Counters counters;
+    private final StatsRegistry stats;
+    private final HealthMonitor health;
+    private final ConsistencyAuditor auditor;
+    private final DeviceStateStore deviceStateStore;
     private final UplinkChannel channel;
 
     public EdgeGateway(GatewayProperties props,
@@ -71,7 +83,29 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
 
         Map<String, PointDefinition> catalog = buildCatalog(devices);
         this.normalizer = new Normalizer(catalog);
-        this.counters = new Counters();
+        this.stats = new StatsRegistry();
+        this.health = new HealthMonitor(props.degradeAfterFailures(),
+                props.faultAfterFailures(), props.recoverAfterSuccesses());
+
+        // 重启续算：恢复统计基线与健康状态（首次启动时文件不存在，从零开始）
+        this.deviceStateStore = new DeviceStateStore(dir.resolve("device-state.json"));
+        DeviceStateStore.PersistedState persisted = deviceStateStore.load();
+        stats.restore(persisted.counters().values().stream().toList());
+        health.restore(persisted.health().values().stream().toList());
+        if (!persisted.counters().isEmpty() || !persisted.health().isEmpty()) {
+            log.info("device state restored: devices={}, health={}",
+                    persisted.counters().keySet(), persisted.health());
+        }
+        health.setTransitionListener(h -> {
+            log.info("[HEALTH] device={} {} (reason={}, at={})", h.deviceId(), h.state(),
+                    h.lastTransitionReason(), h.lastTransitionAt());
+            persistDeviceState();
+        });
+        for (SimulatedDevice d : devices) {
+            health.register(d.deviceId());
+        }
+
+        this.auditor = new ConsistencyAuditor(stats, buffer);
         this.supervisor = new CollectorSupervisor(devices, normalizer, catalog, this,
                 props.collectIntervalMillis());
         this.forwarder = new ForwardWorker(buffer, channel, this,
@@ -88,15 +122,25 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
         // 先停采集，再停补传，关闭期间不再有新 append
         supervisor.stop();
         forwarder.stop();
+        persistDeviceState();
         log.info("edge gateway stopped");
+    }
+
+    private void persistDeviceState() {
+        try {
+            deviceStateStore.save(stats.persistedView(), health.persistedView());
+        } catch (IOException e) {
+            log.error("failed to persist device state", e);
+        }
     }
 
     public SpoolBuffer buffer() {
         return buffer;
     }
 
-    public Counters counters() {
-        return counters;
+    /** 统计登记处（兼容旧 Counters 只读接口）。 */
+    public StatsRegistry counters() {
+        return stats;
     }
 
     public UplinkChannel channel() {
@@ -107,6 +151,16 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
         return supervisor.snapshot();
     }
 
+    /** 逐设备健康快照（含最近切换原因与时间）。 */
+    public Map<String, DeviceHealth> deviceHealth() {
+        return health.snapshot();
+    }
+
+    /** 运行中的统计一致性核对：返回一份自身自洽的核对结论。 */
+    public AuditReport audit() {
+        return auditor.audit();
+    }
+
     public GatewaySnapshot snapshot() {
         return new GatewaySnapshot(
                 System.currentTimeMillis(),
@@ -114,19 +168,26 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
                 buffer.nextSeq(),
                 buffer.confirmedSeq(),
                 buffer.size(),
-                counters.polled(),
-                counters.accepted(),
-                counters.delivered(),
-                counters.dropped(),
-                counters.rejectedByReason(),
-                supervisor.snapshot());
+                stats.polled(),
+                stats.accepted(),
+                stats.delivered(),
+                stats.dropped(),
+                stats.rejectedByReason(),
+                supervisor.snapshot(),
+                health.snapshot());
     }
 
     // ---- CollectionListener（在各设备自己的采集线程上回调，缓冲自身线程安全）----
 
     @Override
     public void onPolled(String deviceId) {
-        counters.incrementPolled();
+        stats.recordPolled(deviceId);
+    }
+
+    @Override
+    public void onPollSucceeded(String deviceId) {
+        stats.recordPollSuccess(deviceId);
+        health.onPollSuccess(deviceId);
     }
 
     @Override
@@ -136,7 +197,7 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
             RejectedReading rr = new RejectedReading(raw, RejectReason.TIMESTAMP_OUT_OF_ORDER,
                     "timestamp " + raw.timestamp() + " < lastAccepted " + lastTs
                             + " for device " + deviceId);
-            counters.incrementRejected(RejectReason.TIMESTAMP_OUT_OF_ORDER);
+            stats.recordRejected(deviceId, RejectReason.TIMESTAMP_OUT_OF_ORDER);
             log.warn("[REJECT] raw={} reason={} detail={}", raw, rr.reason(), rr.detail());
             return;
         }
@@ -144,7 +205,7 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
         AcceptResult result = buffer.append(record);
         if (!result.accepted()) {
             // REJECT_NEWEST：缓冲满，新记录被确定性拒绝；seq 已消耗，形成可解释缺口
-            counters.addDropped(1);
+            stats.recordRejectedNewest(deviceId);
             log.warn("[BUFFER-FULL REJECT-NEWEST] raw={} normalized(seq={}) dropped, "
                             + "policy={}, capacity={}, confirmedSeq={}",
                     raw, result.seq(), props.overflowPolicy(), props.bufferCapacity(),
@@ -152,29 +213,40 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
             return;
         }
 
-        counters.incrementAccepted();
+        stats.recordAccepted(deviceId);
         NormalizedRecord stored = new NormalizedRecord(result.seq(), record.deviceId(),
                 record.pointId(), record.type(), record.value(), record.unit(), record.timestamp());
         log.info("[ACCEPT] raw={} -> normalized={}", raw, stored);
         if (!result.dropped().isEmpty()) {
-            counters.addDropped(result.dropped().size());
-            result.dropped().forEach(v -> log.warn(
-                    "[BUFFER-FULL DROP-OLDEST] evicted seq={} {}/{} ts={} to make room for seq={}",
-                    v.seq(), v.deviceId(), v.pointId(), v.timestamp(), result.seq()));
+            for (NormalizedRecord v : result.dropped()) {
+                stats.recordDroppedOldest(v.deviceId(), 1);
+                log.warn("[BUFFER-FULL DROP-OLDEST] evicted seq={} {}/{} ts={} "
+                                + "to make room for seq={}",
+                        v.seq(), v.deviceId(), v.pointId(), v.timestamp(), result.seq());
+            }
         }
         forwarder.kick();
     }
 
     @Override
     public void onRejected(String deviceId, RejectedReading rejected) {
-        counters.incrementRejected(rejected.reason());
+        stats.recordRejected(deviceId, rejected.reason());
         log.warn("[REJECT] raw={} reason={} detail={}",
                 rejected.raw(), rejected.reason(), rejected.detail());
     }
 
     @Override
     public void onDeviceError(String deviceId, Throwable error) {
+        stats.recordPollFailure(deviceId, String.valueOf(error));
+        health.onPollFailure(deviceId, error);
         log.warn("[DEVICE-ERROR] device={} error={}", deviceId, error.toString());
+    }
+
+    @Override
+    public void onInternalError(String deviceId, RawReading raw, Throwable error) {
+        stats.recordInternalError(deviceId);
+        log.error("[INTERNAL-ERROR] device={} raw={} error={}", deviceId, raw,
+                error.toString());
     }
 
     @Override
@@ -186,13 +258,20 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
 
     @Override
     public void onConfirmed(long confirmedSeq, int recordsThisBatch) {
-        counters.incrementDelivered(recordsThisBatch);
         log.info("[FORWARD] confirmedSeq={} (+{} records), nextSeq={}, pending={}",
                 confirmedSeq, recordsThisBatch, buffer.nextSeq(), buffer.size());
     }
 
     @Override
+    public void onConfirmedRecords(List<NormalizedRecord> confirmed) {
+        for (NormalizedRecord r : confirmed) {
+            stats.recordDelivered(r.deviceId());
+        }
+    }
+
+    @Override
     public void onUplinkDown(Throwable error) {
+        // 注意：上行中断不参与设备健康判定，只影响补传
         log.warn("[UPLINK] down: {} — records spool locally, confirmedSeq={}, pending={}",
                 error.toString(), buffer.confirmedSeq(), buffer.size());
     }

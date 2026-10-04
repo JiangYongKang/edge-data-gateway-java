@@ -100,6 +100,16 @@ public final class DemoRunner {
                 + channel.delivered().stream().map(r -> r.seq() + "/" + r.deviceId()
                 + "/" + r.pointId() + "=" + r.value()).toList());
         System.out.println("[DEMO] devices: " + s.devices());
+        s.health().forEach((id, h) -> System.out.println("[DEMO] health " + id
+                + ": state=" + h.state()
+                + " consecFail=" + h.consecutiveFailures()
+                + " consecSucc=" + h.consecutiveSuccesses()
+                + " lastTransition=" + h.lastTransitionReason()
+                + " at=" + h.lastTransitionAt()
+                + " lastError=" + h.lastError()));
+        var audit = gateway.audit();
+        System.out.println("[DEMO] audit: status=" + audit.status()
+                + " violations=" + audit.violations());
     }
 
     private static RawReading raw(String device, String point, Object value,

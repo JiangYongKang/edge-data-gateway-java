@@ -134,13 +134,14 @@ public final class ForwardWorker {
         }
         if (advanced) {
             // 统计本批中实际完成投递的条数（低于等于新位点、且高于旧位点）
-            int n = 0;
+            List<NormalizedRecord> confirmedRecords = new java.util.ArrayList<>();
             for (NormalizedRecord r : batch) {
                 if (r.seq() <= toConfirm) {
-                    n++;
+                    confirmedRecords.add(r);
                 }
             }
-            listener.onConfirmed(toConfirm, n);
+            listener.onConfirmedRecords(List.copyOf(confirmedRecords));
+            listener.onConfirmed(toConfirm, confirmedRecords.size());
             // 成功且位点推进：若还有积压继续排空
             return true;
         }
