@@ -1,5 +1,6 @@
 package com.github.highcumontoa.edgedatagatewayjava.forward;
 
+import com.github.highcumontoa.edgedatagatewayjava.audit.ConsistencyGate;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.SpoolBuffer;
 import com.github.highcumontoa.edgedatagatewayjava.model.NormalizedRecord;
 import com.github.highcumontoa.edgedatagatewayjava.uplink.UplinkChannel;
@@ -29,6 +30,7 @@ public final class ForwardWorker {
     private final ForwardListener listener;
     private final long drainIntervalMillis;
     private final int batchSize;
+    private final ConsistencyGate gate;
 
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> task;
@@ -39,12 +41,14 @@ public final class ForwardWorker {
                          UplinkChannel channel,
                          ForwardListener listener,
                          long drainIntervalMillis,
-                         int batchSize) {
+                         int batchSize,
+                         ConsistencyGate gate) {
         this.buffer = buffer;
         this.channel = channel;
         this.listener = listener;
         this.drainIntervalMillis = drainIntervalMillis;
         this.batchSize = batchSize;
+        this.gate = gate;
     }
 
     public void start() {
@@ -127,25 +131,35 @@ public final class ForwardWorker {
         // 只确认本批真正覆盖的 seq 范围（防御性：不能确认超出本批最大 seq 的位点）
         long maxBatchSeq = batch.get(batch.size() - 1).seq();
         long toConfirm = Math.min(ackSeq, maxBatchSeq);
-        boolean advanced = buffer.confirm(toConfirm);
+        // 位点推进 + 送达记账是一个复合动作：整体在一致性闸门写锁内完成，
+        // 核对器永远看不到“缓冲已确认、统计未记送达”的中间态
+        gate.writeLock().lock();
+        final boolean advanced;
+        try {
+            // 关键：确认前先在锁内取旧位点。批可能被并发 DROP_OLDEST 部分逐出
+            // （逐出已按“丢弃”记账并推进位点），只有落在 (旧位点, 新位点] 的
+            // 记录才计为“送达”——一条记录只能计入送达或丢弃之一，绝不双计
+            long prevConfirmed = buffer.confirmedSeq();
+            advanced = buffer.confirm(toConfirm);
+            if (advanced) {
+                List<NormalizedRecord> confirmedRecords = new java.util.ArrayList<>();
+                for (NormalizedRecord r : batch) {
+                    if (r.seq() > prevConfirmed && r.seq() <= toConfirm) {
+                        confirmedRecords.add(r);
+                    }
+                }
+                listener.onConfirmedRecords(List.copyOf(confirmedRecords));
+                listener.onConfirmed(toConfirm, confirmedRecords.size());
+            }
+        } finally {
+            gate.writeLock().unlock();
+        }
         if (down) {
             down = false;
             listener.onUplinkUp();
         }
-        if (advanced) {
-            // 统计本批中实际完成投递的条数（低于等于新位点、且高于旧位点）
-            List<NormalizedRecord> confirmedRecords = new java.util.ArrayList<>();
-            for (NormalizedRecord r : batch) {
-                if (r.seq() <= toConfirm) {
-                    confirmedRecords.add(r);
-                }
-            }
-            listener.onConfirmedRecords(List.copyOf(confirmedRecords));
-            listener.onConfirmed(toConfirm, confirmedRecords.size());
-            // 成功且位点推进：若还有积压继续排空
-            return true;
-        }
+        // 成功且位点推进：若还有积压继续排空；
         // 通道虽返回成功但位点未推进（异常 ack）：停止本轮排空，等下周期，避免自旋
-        return false;
+        return advanced;
     }
 }

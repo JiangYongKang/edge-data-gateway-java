@@ -12,16 +12,18 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
 
 /**
  * 统计一致性核对器。
  *
- * <p>一致性切面：统计快照在单锁内生成，本身自洽；与缓冲联动的计数
- * （accepted / delivered / droppedOldest / rejectedNewest）只会在缓冲
- * append/confirm 之后变化，因此“读缓冲视图 → 读统计快照 → 再读缓冲视图，
- * 两次视图相等”即构成一个一致性切面。采集与补传并发进行时若切面不稳定
- * 就重试；超过限定次数返回 {@link AuditReport.Status#UNSTABLE}，
+ * <p>一致性切面：所有“缓冲变更 + 统计记账”的复合写都在
+ * {@link ConsistencyGate} 写锁内完成，核对器在读锁内一次性读取
+ * 缓冲视图与统计快照，因此拿到的必然是同一逻辑瞬间的完整切面——
  * 绝不把不同时间点的计数拼成一份自相矛盾的报告。
+ * 只有在限定时间内拿不到读锁（并发写持续不断）时才返回
+ * {@link AuditReport.Status#UNSTABLE}，明确表示当前无法判定。
  *
  * <p>核对口径：
  * <ul>
@@ -36,39 +38,45 @@ import java.util.Set;
 public final class ConsistencyAuditor {
 
     private static final int MAX_ATTEMPTS = 100;
+    private static final long LOCK_WAIT_MILLIS = 10L;
 
     private final StatsRegistry stats;
     private final SpoolBuffer buffer;
+    private final ConsistencyGate gate;
 
-    public ConsistencyAuditor(StatsRegistry stats, SpoolBuffer buffer) {
+    public ConsistencyAuditor(StatsRegistry stats, SpoolBuffer buffer,
+                              ConsistencyGate gate) {
         this.stats = stats;
         this.buffer = buffer;
+        this.gate = gate;
     }
 
     public AuditReport audit() {
-        StatsSnapshot snap = null;
-        BufferView view = null;
-        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            BufferView before = buffer.view();
-            snap = stats.snapshot();
-            BufferView after = buffer.view();
-            if (before.equals(after)) {
-                view = after;
+        Lock read = gate.readLock();
+        boolean acquired = false;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS && !acquired; attempt++) {
+            try {
+                acquired = read.tryLock(LOCK_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 break;
             }
-            if (attempt + 1 < MAX_ATTEMPTS) {
-                try {
-                    Thread.sleep(1L);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
         }
-        if (view == null) {
-            // 并发写持续不断：不给出任何核对结论，避免自相矛盾
+        if (!acquired) {
+            // 并发写持续不断、拿不到一致性切面：明说无法判定，
+            // 附上的统计/缓冲视图仅供参考，不据其给出任何核对结论
             return new AuditReport(System.currentTimeMillis(),
-                    AuditReport.Status.UNSTABLE, snap, buffer.view(), List.of());
+                    AuditReport.Status.UNSTABLE, stats.snapshot(), buffer.view(),
+                    List.of());
+        }
+        final StatsSnapshot snap;
+        final BufferView view;
+        try {
+            // 读锁内一次性取切面：视图与快照来自同一逻辑瞬间
+            view = buffer.view();
+            snap = stats.snapshot();
+        } finally {
+            read.unlock();
         }
         List<ViolationHolder> found = new ArrayList<>();
         checkDevicePollAccounting(snap, found);

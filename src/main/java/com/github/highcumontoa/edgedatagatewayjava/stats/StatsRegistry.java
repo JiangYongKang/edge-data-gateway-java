@@ -16,7 +16,7 @@ import java.util.Map;
  *
  * <p>计数口径：
  * <ul>
- *   <li>polls = okPolls + pollFailures（每次轮询必居其一）；</li>
+ *   <li>polls = okPolls + pollFailures（轮询与其结果原子记录，任意瞬间成立）；</li>
  *   <li>accepted：通过全部校验并成功写入缓冲的记录；</li>
  *   <li>rejectedByReason：归一化拒绝 + 网关乱序拒绝（按原因分开）；</li>
  *   <li>rejectedNewest：缓冲满且策略为 REJECT_NEWEST 时被拒的新记录（消耗 seq）；</li>
@@ -40,17 +40,23 @@ public final class StatsRegistry {
         }
     }
 
-    public synchronized void recordPolled(String deviceId) {
-        polled++;
-        dev(deviceId).polls++;
-    }
-
+    /**
+     * 轮询与结果在同一原子动作内记录：polls 只统计“已出结果”的轮询，
+     * 因此任意瞬间 polls == okPolls + pollFailures 都成立（无在途窗口）。
+     */
     public synchronized void recordPollSuccess(String deviceId) {
-        dev(deviceId).okPolls++;
+        polled++;
+        Dev d = dev(deviceId);
+        d.polls++;
+        d.okPolls++;
     }
 
+    /** 见 {@link #recordPollSuccess}：轮询与失败结果原子记录。 */
     public synchronized void recordPollFailure(String deviceId, String error) {
-        dev(deviceId).pollFailures++;
+        polled++;
+        Dev d = dev(deviceId);
+        d.polls++;
+        d.pollFailures++;
     }
 
     public synchronized void recordInternalError(String deviceId) {

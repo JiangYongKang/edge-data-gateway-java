@@ -2,12 +2,15 @@ package com.github.highcumontoa.edgedatagatewayjava.gateway;
 
 import com.github.highcumontoa.edgedatagatewayjava.audit.AuditReport;
 import com.github.highcumontoa.edgedatagatewayjava.audit.ConsistencyAuditor;
+import com.github.highcumontoa.edgedatagatewayjava.audit.ConsistencyGate;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.AcceptResult;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.BufferStateStore;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.SpoolBuffer;
 import com.github.highcumontoa.edgedatagatewayjava.collect.CollectionListener;
+import com.github.highcumontoa.edgedatagatewayjava.collect.CollectorStatus;
 import com.github.highcumontoa.edgedatagatewayjava.collect.CollectorSupervisor;
 import com.github.highcumontoa.edgedatagatewayjava.collect.DeviceStats;
+import com.github.highcumontoa.edgedatagatewayjava.collect.DeviceStatus;
 import com.github.highcumontoa.edgedatagatewayjava.config.GatewayProperties;
 import com.github.highcumontoa.edgedatagatewayjava.device.SimulatedDevice;
 import com.github.highcumontoa.edgedatagatewayjava.forward.ForwardListener;
@@ -21,8 +24,10 @@ import com.github.highcumontoa.edgedatagatewayjava.model.RawReading;
 import com.github.highcumontoa.edgedatagatewayjava.model.RejectReason;
 import com.github.highcumontoa.edgedatagatewayjava.model.RejectedReading;
 import com.github.highcumontoa.edgedatagatewayjava.normalize.Normalizer;
+import com.github.highcumontoa.edgedatagatewayjava.stats.DeviceCounters;
 import com.github.highcumontoa.edgedatagatewayjava.stats.DeviceStateStore;
 import com.github.highcumontoa.edgedatagatewayjava.stats.StatsRegistry;
+import com.github.highcumontoa.edgedatagatewayjava.stats.StatsSnapshot;
 import com.github.highcumontoa.edgedatagatewayjava.uplink.UplinkChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,6 +60,7 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
     private static final Logger log = LoggerFactory.getLogger(EdgeGateway.class);
 
     private final GatewayProperties props;
+    private final ConsistencyGate gate = new ConsistencyGate();
     private final SpoolBuffer buffer;
     private final Normalizer normalizer;
     private final CollectorSupervisor supervisor;
@@ -105,11 +111,11 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
             health.register(d.deviceId());
         }
 
-        this.auditor = new ConsistencyAuditor(stats, buffer);
+        this.auditor = new ConsistencyAuditor(stats, buffer, gate);
         this.supervisor = new CollectorSupervisor(devices, normalizer, catalog, this,
                 props.collectIntervalMillis());
         this.forwarder = new ForwardWorker(buffer, channel, this,
-                props.drainIntervalMillis(), props.batchSize());
+                props.drainIntervalMillis(), props.batchSize(), gate);
     }
 
     public void start() {
@@ -147,8 +153,33 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
         return channel;
     }
 
+    /**
+     * 逐设备统计视图：计数全部取自 StatsRegistry 同一份快照（与整体统计同源），
+     * 在线状态/时间戳取自采集运行时。任意时刻各设备 acceptedCount 之和 == 整体
+     * accepted，各设备 rejectedCount 之和 == 整体各拒绝原因之和 + rejectedNewest。
+     */
     public Map<String, DeviceStats> deviceStats() {
-        return supervisor.snapshot();
+        StatsSnapshot snap = stats.snapshot();
+        Map<String, CollectorStatus> runtime = supervisor.snapshot();
+        Map<String, DeviceStats> out = new LinkedHashMap<>();
+        runtime.forEach((id, rt) -> out.put(id, toDeviceStats(id, rt,
+                snap.devices().get(id))));
+        snap.devices().forEach((id, c) -> out.computeIfAbsent(id,
+                k -> toDeviceStats(id, null, c)));
+        return out;
+    }
+
+    private static DeviceStats toDeviceStats(String id, CollectorStatus rt,
+                                             DeviceCounters c) {
+        return new DeviceStats(id,
+                rt != null ? rt.status() : DeviceStatus.DOWN,
+                c != null ? c.polls() : 0L,
+                c != null ? c.pollFailures() + c.internalErrors() : 0L,
+                c != null ? c.accepted() : 0L,
+                c != null ? c.rejectedTotal() + c.rejectedNewest() : 0L,
+                rt != null ? rt.lastPollAt() : null,
+                rt != null ? rt.lastErrorAt() : null,
+                rt != null ? rt.lastError() : null);
     }
 
     /** 逐设备健康快照（含最近切换原因与时间）。 */
@@ -173,16 +204,11 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
                 stats.delivered(),
                 stats.dropped(),
                 stats.rejectedByReason(),
-                supervisor.snapshot(),
+                deviceStats(),
                 health.snapshot());
     }
 
     // ---- CollectionListener（在各设备自己的采集线程上回调，缓冲自身线程安全）----
-
-    @Override
-    public void onPolled(String deviceId) {
-        stats.recordPolled(deviceId);
-    }
 
     @Override
     public void onPollSucceeded(String deviceId) {
@@ -192,38 +218,48 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
 
     @Override
     public void onAccepted(String deviceId, RawReading raw, NormalizedRecord record) {
-        Long lastTs = buffer.lastTimestamp(deviceId);
-        if (lastTs != null && raw.timestamp() < lastTs) {
-            RejectedReading rr = new RejectedReading(raw, RejectReason.TIMESTAMP_OUT_OF_ORDER,
-                    "timestamp " + raw.timestamp() + " < lastAccepted " + lastTs
-                            + " for device " + deviceId);
-            stats.recordRejected(deviceId, RejectReason.TIMESTAMP_OUT_OF_ORDER);
-            log.warn("[REJECT] raw={} reason={} detail={}", raw, rr.reason(), rr.detail());
-            return;
-        }
-
-        AcceptResult result = buffer.append(record);
-        if (!result.accepted()) {
-            // REJECT_NEWEST：缓冲满，新记录被确定性拒绝；seq 已消耗，形成可解释缺口
-            stats.recordRejectedNewest(deviceId);
-            log.warn("[BUFFER-FULL REJECT-NEWEST] raw={} normalized(seq={}) dropped, "
-                            + "policy={}, capacity={}, confirmedSeq={}",
-                    raw, result.seq(), props.overflowPolicy(), props.bufferCapacity(),
-                    buffer.confirmedSeq());
-            return;
-        }
-
-        stats.recordAccepted(deviceId);
-        NormalizedRecord stored = new NormalizedRecord(result.seq(), record.deviceId(),
-                record.pointId(), record.type(), record.value(), record.unit(), record.timestamp());
-        log.info("[ACCEPT] raw={} -> normalized={}", raw, stored);
-        if (!result.dropped().isEmpty()) {
-            for (NormalizedRecord v : result.dropped()) {
-                stats.recordDroppedOldest(v.deviceId(), 1);
-                log.warn("[BUFFER-FULL DROP-OLDEST] evicted seq={} {}/{} ts={} "
-                                + "to make room for seq={}",
-                        v.seq(), v.deviceId(), v.pointId(), v.timestamp(), result.seq());
+        // 乱序判定 + 缓冲写入 + 统计记账是一个复合动作：整体在一致性闸门写锁内完成，
+        // 核对器因此永远看不到“缓冲已变、统计未记”（或反之）的中间态
+        gate.writeLock().lock();
+        try {
+            Long lastTs = buffer.lastTimestamp(deviceId);
+            if (lastTs != null && raw.timestamp() < lastTs) {
+                RejectedReading rr = new RejectedReading(raw,
+                        RejectReason.TIMESTAMP_OUT_OF_ORDER,
+                        "timestamp " + raw.timestamp() + " < lastAccepted " + lastTs
+                                + " for device " + deviceId);
+                stats.recordRejected(deviceId, RejectReason.TIMESTAMP_OUT_OF_ORDER);
+                log.warn("[REJECT] raw={} reason={} detail={}", raw, rr.reason(),
+                        rr.detail());
+                return;
             }
+
+            AcceptResult result = buffer.append(record);
+            if (!result.accepted()) {
+                // REJECT_NEWEST：缓冲满，新记录被确定性拒绝；seq 已消耗，形成可解释缺口
+                stats.recordRejectedNewest(deviceId);
+                log.warn("[BUFFER-FULL REJECT-NEWEST] raw={} normalized(seq={}) dropped, "
+                                + "policy={}, capacity={}, confirmedSeq={}",
+                        raw, result.seq(), props.overflowPolicy(), props.bufferCapacity(),
+                        buffer.confirmedSeq());
+                return;
+            }
+
+            stats.recordAccepted(deviceId);
+            NormalizedRecord stored = new NormalizedRecord(result.seq(), record.deviceId(),
+                    record.pointId(), record.type(), record.value(), record.unit(),
+                    record.timestamp());
+            log.info("[ACCEPT] raw={} -> normalized={}", raw, stored);
+            if (!result.dropped().isEmpty()) {
+                for (NormalizedRecord v : result.dropped()) {
+                    stats.recordDroppedOldest(v.deviceId(), 1);
+                    log.warn("[BUFFER-FULL DROP-OLDEST] evicted seq={} {}/{} ts={} "
+                                    + "to make room for seq={}",
+                            v.seq(), v.deviceId(), v.pointId(), v.timestamp(), result.seq());
+                }
+            }
+        } finally {
+            gate.writeLock().unlock();
         }
         forwarder.kick();
     }

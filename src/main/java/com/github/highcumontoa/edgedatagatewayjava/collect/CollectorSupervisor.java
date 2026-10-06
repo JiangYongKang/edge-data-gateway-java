@@ -15,7 +15,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 多设备并发采集调度。
@@ -23,6 +22,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>每个设备拥有独立的单线程调度器：任何一个设备轮询异常（甚至 Error 级故障）都在
  * 该设备自己的任务内被捕获并回调 {@link CollectionListener#onDeviceError}，
  * 不会传播到调度线程或其它设备。
+ *
+ * <p>本类只维护在线状态与时间戳类运行时信息（{@link CollectorStatus}）；
+ * 接受/拒绝/轮询等计数由 {@link CollectionListener} 的实现方（网关）统一记入
+ * StatsRegistry——一条读数最终算接受还是算拒绝由网关在乱序检查与缓冲写入后
+ * 唯一决定，采集层不另存一份可能与之分叉的计数。
  */
 public final class CollectorSupervisor {
 
@@ -75,15 +79,12 @@ public final class CollectorSupervisor {
 
     private void safePoll(SimulatedDevice device) {
         DeviceRuntime rt = runtimes.get(device.deviceId());
-        rt.pollCount.incrementAndGet();
         rt.lastPollAt = System.currentTimeMillis();
-        listener.onPolled(device.deviceId());
         List<RawReading> readings;
         try {
             readings = device.poll();
         } catch (Throwable t) {
             // 捕获 Throwable：单设备的任何故障都不得影响调度器和其它设备
-            rt.errorCount.incrementAndGet();
             rt.lastErrorAt = System.currentTimeMillis();
             rt.lastError = String.valueOf(t);
             listener.onDeviceError(device.deviceId(), t);
@@ -100,17 +101,16 @@ public final class CollectorSupervisor {
             } catch (Throwable t) {
                 // 归一化内部不应抛出；万一抛出，计为内部错误而不是设备故障，
                 // 不影响该设备的健康判定
-                rt.errorCount.incrementAndGet();
                 rt.lastErrorAt = System.currentTimeMillis();
                 rt.lastError = String.valueOf(t);
                 listener.onInternalError(device.deviceId(), raw, t);
                 continue;
             }
+            // 接受/拒绝计数不在此记录：归一化通过后网关还要做乱序检查与缓冲写入，
+            // 最终口径由网关统一计入 StatsRegistry（见 CollectionListener 回调）
             if (result.accepted()) {
-                rt.acceptedCount.incrementAndGet();
                 listener.onAccepted(device.deviceId(), raw, result.record());
             } else {
-                rt.rejectedCount.incrementAndGet();
                 listener.onRejected(device.deviceId(), result.rejected());
             }
         }
@@ -124,24 +124,18 @@ public final class CollectorSupervisor {
         }
     }
 
-    public Map<String, DeviceStats> snapshot() {
-        Map<String, DeviceStats> out = new LinkedHashMap<>();
-        runtimes.forEach((id, rt) -> out.put(id, new DeviceStats(
-                id, rt.status,
-                rt.pollCount.get(), rt.errorCount.get(),
-                rt.acceptedCount.get(), rt.rejectedCount.get(),
-                rt.lastPollAt, rt.lastErrorAt, rt.lastError)));
+    /** 采集运行时快照（只含非计数信息；计数口径以 StatsRegistry 为准）。 */
+    public Map<String, CollectorStatus> snapshot() {
+        Map<String, CollectorStatus> out = new LinkedHashMap<>();
+        runtimes.forEach((id, rt) -> out.put(id, new CollectorStatus(
+                id, rt.status, rt.lastPollAt, rt.lastErrorAt, rt.lastError)));
         return out;
     }
 
-    /** 单设备运行时统计（可变，仅被该设备自己的采集线程写，读线程看到快照一致值）。 */
+    /** 单设备运行时信息（可变，仅被该设备自己的采集线程写，读线程看到快照一致值）。 */
     private static final class DeviceRuntime {
         final String deviceId;
         volatile DeviceStatus status;
-        final AtomicLong pollCount = new AtomicLong();
-        final AtomicLong errorCount = new AtomicLong();
-        final AtomicLong acceptedCount = new AtomicLong();
-        final AtomicLong rejectedCount = new AtomicLong();
         volatile Long lastPollAt = null;
         volatile Long lastErrorAt = null;
         volatile String lastError = null;

@@ -1,5 +1,6 @@
 package com.github.highcumontoa.edgedatagatewayjava.tests;
 
+import com.github.highcumontoa.edgedatagatewayjava.audit.ConsistencyGate;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.BufferStateStore;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.SpoolBuffer;
 import com.github.highcumontoa.edgedatagatewayjava.demo.DemoRunner;
@@ -39,7 +40,7 @@ class ForwardWorkerTest {
         buf.recover();
         MockUplinkChannel channel = new MockUplinkChannel(false); // 启动即断网
         CountingListener listener = new CountingListener();
-        ForwardWorker worker = new ForwardWorker(buf, channel, listener, 20L, 100);
+        ForwardWorker worker = new ForwardWorker(buf, channel, listener, 20L, 100, new ConsistencyGate());
         worker.start();
 
         for (int i = 0; i < 10; i++) {
@@ -75,7 +76,7 @@ class ForwardWorkerTest {
         buf.recover();
         MockUplinkChannel channel = new MockUplinkChannel(true);
         CountingListener listener = new CountingListener();
-        ForwardWorker worker = new ForwardWorker(buf, channel, listener, 20L, 100);
+        ForwardWorker worker = new ForwardWorker(buf, channel, listener, 20L, 100, new ConsistencyGate());
         worker.start();
 
         for (int i = 0; i < 20; i++) {
@@ -151,7 +152,7 @@ class ForwardWorkerTest {
             }
         };
         CountingListener l1 = new CountingListener();
-        ForwardWorker w1 = new ForwardWorker(buf, flaky, l1, 20L, 100);
+        ForwardWorker w1 = new ForwardWorker(buf, flaky, l1, 20L, 100, new ConsistencyGate());
         w1.start();
         buf.append(rec(0, 100));
         DemoRunner.await(() -> buf.confirmedSeq() == 0L, 3000);
@@ -167,7 +168,7 @@ class ForwardWorkerTest {
         assertEquals(List.of(1L), seqs(reopened.pending()));
         MockUplinkChannel channel2 = new MockUplinkChannel(false);
         CountingListener l2 = new CountingListener();
-        ForwardWorker w2 = new ForwardWorker(reopened, channel2, l2, 20L, 100);
+        ForwardWorker w2 = new ForwardWorker(reopened, channel2, l2, 20L, 100, new ConsistencyGate());
         w2.start();
         Thread.sleep(150);
         // 通道仍断开：seq1 必须留在缓冲，位点不动

@@ -33,10 +33,10 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 | `buffer` | `SpoolBuffer` / `AcceptResult` / `BufferStateStore` | 有界缓冲、WAL、seq 位点与溢出策略 |
 | `uplink` | `UplinkChannel` / `MockUplinkChannel` | 上行通道抽象与模拟（断网/重连、按 seq 幂等去重） |
 | `forward` | `ForwardWorker` | 单线程顺序补传，断网重试，重复投递/确认安全 |
-| `collect` | `CollectorSupervisor` | 每设备独立调度线程，异常隔离、在线状态与设备统计 |
+| `collect` | `CollectorSupervisor` / `CollectorStatus` / `DeviceStats` | 每设备独立调度线程，异常隔离与在线状态；DeviceStats 计数由 StatsRegistry 同源派生 |
 | `stats` | `StatsRegistry` / `StatsSnapshot` / `DeviceCounters` / `DeviceStateStore` | 全局+逐设备计数（单锁自洽快照）、设备级状态持久化 |
 | `health` | `HealthMonitor` / `HealthState` / `DeviceHealth` | 设备健康分级状态机，只由真实轮询结果驱动 |
-| `audit` | `ConsistencyAuditor` / `AuditReport` | 运行中统计一致性核对，逐设备指出不一致类别 |
+| `audit` | `ConsistencyAuditor` / `AuditReport` / `ConsistencyGate` | 运行中统计一致性核对（读写锁切面），逐设备指出不一致类别 |
 | `gateway` | `EdgeGateway` / `GatewaySnapshot` | 编排与一致性保证 |
 | `config` | `GatewayProperties` | 数据目录、容量、溢出策略、采集/补传周期、批大小、健康阈值 |
 | `demo` | `DemoRunner` | 本地可运行演示 + 测试用条件等待工具 |
@@ -111,6 +111,9 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 
 - 每个设备拥有**独立的单线程调度器**（`collector-<deviceId>`），补传为独立
   单线程（`forward-worker`）。采集与缓冲交互通过 `SpoolBuffer` 的内置锁串行化。
+- **统计与缓冲的复合写互斥**：采集接受/溢出丢弃/拒新、补传确认都在
+  `ConsistencyGate` 写锁内完成“缓冲变更 + 统计记账”，核对器在读锁内取切面，
+  因此并发下每份核对结论都来自同一逻辑瞬间（详见第 7 节）。
 - 设备轮询中的任何 `Throwable`（含脚本主动抛出的故障、设备掉线异常）都在该设备
   线程内捕获，记为 `onDeviceError`、置设备 `DOWN`，**不会传播到调度器或其它设备**；
   下一次轮询成功即恢复 `UP`。在线状态与逐设备统计（轮询/错误/接受/拒绝次数、
@@ -146,6 +149,31 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 
 ## 7. 运行中统计一致性核对
 
+### 7.1 逐台与整体的口径关系
+
+一条读数的最终归属只有两种：**接受**（通过全部校验并成功写入缓冲）或
+**拒绝**（归一化拒绝、网关乱序拒绝、缓冲满拒新），由网关在乱序检查与缓冲
+写入之后唯一决定，且**接受/拒绝与缓冲变更在同一把锁内记账**：
+
+- `StatsRegistry` 每条记录都在一次原子调用内同时更新全局与逐台计数，
+  因此任意瞬间：**各设备 accepted 之和 == 整体 accepted**；
+  **各设备某拒绝原因之和 == 整体对应该原因**；
+- `deviceStats()` 的计数（pollCount / errorCount / acceptedCount /
+  rejectedCount）全部派生自 StatsRegistry 同一份快照（与整体统计同源），
+  采集层不另存计数——不会出现"设备侧算接受、整体侧算拒绝"的分叉：
+  - `acceptedCount` = 逐台 accepted（乱序、拒新都不算接受）；
+  - `rejectedCount` = 逐台各拒绝原因之和 + rejectedNewest；
+  - `pollCount` = 逐台 polls；`errorCount` = pollFailures + internalErrors；
+- 轮询计数与其结果（成功/失败）在**同一次原子记录**内完成，
+  `polls == okPolls + pollFailures` 在任意瞬间成立（没有"已发起未出结果"
+  的在途窗口）；
+- 送达与丢弃互斥记账：补传确认时只把落在 (旧位点, 新位点] 的记录计为
+  delivered——批内被并发 DROP_OLDEST 逐出的记录已计入 droppedOldest，
+  不会重复计为送达。一条被接受的记录在任何时刻恰好处于
+  {待补传 pending, 已送达 delivered, 已丢弃 droppedOldest} 三者之一。
+
+### 7.2 核对口径
+
 `EdgeGateway.audit()` 随时返回一份 `AuditReport`（`CONSISTENT` / `INCONSISTENT`
 / `UNSTABLE`），核对口径：
 
@@ -159,11 +187,20 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 发现不一致时，`violations` 逐条给出**哪台设备（全局关系为 null）、哪一类计数
 （`Category`）、期望值与实际值**，而不是笼统的失败结论。
 
-**自洽性边界**：统计快照在 `StatsRegistry` 单锁内生成，本身不会被并发写撕裂；
-与缓冲联动的计数只在缓冲 append/confirm 之后变化，因此核对器采用
-"读缓冲视图 → 读统计快照 → 再读缓冲视图，两次视图相等"的一致性切面。
-采集与补传并发进行时若切面不稳定会重试（最多 100 次）；极端持续写入下返回
-`UNSTABLE`——**绝不把不同时间点的计数拼成一份自相矛盾的报告**。
+### 7.3 并发下核对结论的自洽性边界
+
+- 所有"缓冲变更 + 统计记账"的复合写（采集接受、DROP_OLDEST 逐出、
+  REJECT_NEWEST 拒新、补传确认）都在 `ConsistencyGate`（公平读写锁）的
+  **写锁**内完成；核对器在**读锁**内一次性读取缓冲视图与统计快照。
+  读写互斥保证每份 `CONSISTENT` / `INCONSISTENT` 结论都来自同一逻辑瞬间的
+  完整切面——**绝不会把不同时间点的计数拼成一份自相矛盾的报告**。
+- `UNSTABLE`（无法判定）只在一种情况下出现：核对器在限定重试
+  （100 次 × 10ms _tryLock_）内拿不到读锁，即并发写持续不断。
+  此时报告不给出任何核对结论（violations 为空），附带的统计/缓冲视图
+  仅供参考。写锁持有时间是微秒级复合记账，实际运行中几乎不会触发；
+  一旦触发，语义是"当前无法判定"，稍后再查即可。
+- 这些关系不只在停稳后成立：断网积压、缓冲满溢出、乱序拒绝、
+  重启续算后继续运行，任意时刻的核对结论都自洽（有自动化测试覆盖，见第 10 节）。
 
 ## 8. 重启续算与兼容范围
 
@@ -211,11 +248,22 @@ health(逐设备健康)`。核对结论通过 `EdgeGateway.audit()` 获取。
 | `GatewayIntegrationTest`（5） | 单设备异常不影响其它设备且统计如实、畸形+乱序读数原因可区分且脏值不到下游、断网溢出 DROP_OLDEST 端到端守恒、网关重启不重放已确认且 seq 连续、重启后乱序时间戳位点恢复 |
 | `HealthMonitorTest`（4） | 反复出错 HEALTHY→DEGRADED→FAULT 且切换原因/时间可查、恢复观察通过才回正常、观察期复发退回降级、重启恢复后续算不重新累计 |
 | `HealthAndAuditTest`（6） | 网关端到端：反复出错降级、上行中断不误判设备不健康、恢复观察期可观察、并发采集+断连+溢出下 300 次核对无自相矛盾、重启后健康与统计续算不重复计数、REJECT_NEWEST 序号守恒 |
+| `ReconciliationTest`（3） | 统计对账：乱序拒绝后逐台与整体口径一致（设备侧不会把乱序读数算接受）、并发采集+补传+溢出+乱序下 500 次核对无自相矛盾且场景确实覆盖溢出/乱序、带积压重启后逐台基线与整体不错位且恢复补传不重复计数 |
 
-测试日志中可直接看到 `[原始读数]`、`[归一化结果]`、`[补传位点]` 三类打印。
-关键一致性断言：下游记录严格按 seq 升序且全局唯一；
+测试日志中可直接看到 `[原始读数]`、`[归一化结果]`、`[补传位点]`、`[对账]`、
+`[统计核对]` 等打印，每个用例的覆盖点与结论（CONSISTENT/UNSTABLE、逐台计数）
+都在日志里。关键一致性断言：下游记录严格按 seq 升序且全局唯一；
 `已分配 seq 数 = 下游记录数 + 溢出丢弃数`；拒绝原因分项计数与注入的异常一一对应；
-逐设备 `errorCount/acceptedCount` 与故障/恢复剧本一致。
+逐设备 `errorCount/acceptedCount` 与故障/恢复剧本一致；
+任意时刻逐台计数之和 == 整体计数（含并发与重启场景）。
+
+本地验证：
+
+```bash
+mvn test                                   # 全量 36 个用例
+mvn test -Dtest=ReconciliationTest         # 只看对账一致性三个用例（日志带 [对账] 前缀）
+mvn test -Dtest=HealthAndAuditTest         # 健康分级与并发核对自洽
+```
 
 ## 11. 配置
 
