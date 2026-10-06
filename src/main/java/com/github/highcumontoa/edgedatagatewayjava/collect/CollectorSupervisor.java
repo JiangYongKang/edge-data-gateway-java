@@ -6,6 +6,7 @@ import com.github.highcumontoa.edgedatagatewayjava.model.NormalizeResult;
 import com.github.highcumontoa.edgedatagatewayjava.model.PointDefinition;
 import com.github.highcumontoa.edgedatagatewayjava.model.RawReading;
 import com.github.highcumontoa.edgedatagatewayjava.normalize.Normalizer;
+import com.github.highcumontoa.edgedatagatewayjava.stats.DeviceCounters;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -61,6 +62,25 @@ public final class CollectorSupervisor {
         }
     }
 
+    /**
+     * 重启续算：用恢复出的逐设备统计基线初始化采集侧运行计数，
+     * 使逐台采集统计（DeviceStats）与整体统计（StatsRegistry）衔接同一基线，
+     * 重启后两侧不错位。必须在 {@link #start()} 之前调用。
+     */
+    public void restoreBaseline(List<DeviceCounters> restored) {
+        for (DeviceCounters c : restored) {
+            DeviceRuntime rt = runtimes.get(c.deviceId());
+            if (rt == null) {
+                continue;
+            }
+            rt.pollCount.addAndGet(c.polls());
+            rt.errorCount.addAndGet(c.pollFailures() + c.internalErrors());
+            rt.acceptedCount.addAndGet(c.accepted());
+            rt.rejectedCount.addAndGet(c.rejectedTotal());
+            rt.droppedNewestCount.addAndGet(c.rejectedNewest());
+        }
+    }
+
     public void stop() {
         for (ScheduledExecutorService executor : executors) {
             executor.shutdownNow();
@@ -107,8 +127,15 @@ public final class CollectorSupervisor {
                 continue;
             }
             if (result.accepted()) {
-                rt.acceptedCount.incrementAndGet();
-                listener.onAccepted(device.deviceId(), raw, result.record());
+                // 归一化通过不代表最终被接受：网关还可能按乱序拒绝或缓冲拒新，
+                // 以网关返回的处置结果为准计数，保证逐台与整体口径一致
+                AcceptOutcome outcome = listener.onAccepted(device.deviceId(), raw,
+                        result.record());
+                switch (outcome) {
+                    case ACCEPTED -> rt.acceptedCount.incrementAndGet();
+                    case REJECTED_OUT_OF_ORDER -> rt.rejectedCount.incrementAndGet();
+                    case DROPPED_NEWEST -> rt.droppedNewestCount.incrementAndGet();
+                }
             } else {
                 rt.rejectedCount.incrementAndGet();
                 listener.onRejected(device.deviceId(), result.rejected());
@@ -130,6 +157,7 @@ public final class CollectorSupervisor {
                 id, rt.status,
                 rt.pollCount.get(), rt.errorCount.get(),
                 rt.acceptedCount.get(), rt.rejectedCount.get(),
+                rt.droppedNewestCount.get(),
                 rt.lastPollAt, rt.lastErrorAt, rt.lastError)));
         return out;
     }
@@ -142,6 +170,7 @@ public final class CollectorSupervisor {
         final AtomicLong errorCount = new AtomicLong();
         final AtomicLong acceptedCount = new AtomicLong();
         final AtomicLong rejectedCount = new AtomicLong();
+        final AtomicLong droppedNewestCount = new AtomicLong();
         volatile Long lastPollAt = null;
         volatile Long lastErrorAt = null;
         volatile String lastError = null;

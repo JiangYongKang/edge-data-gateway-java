@@ -127,20 +127,16 @@ public final class ForwardWorker {
         // 只确认本批真正覆盖的 seq 范围（防御性：不能确认超出本批最大 seq 的位点）
         long maxBatchSeq = batch.get(batch.size() - 1).seq();
         long toConfirm = Math.min(ackSeq, maxBatchSeq);
-        boolean advanced = buffer.confirm(toConfirm);
+        SpoolBuffer.ConfirmResult confirmResult = buffer.confirmWithRecords(toConfirm);
+        boolean advanced = confirmResult.advanced();
         if (down) {
             down = false;
             listener.onUplinkUp();
         }
         if (advanced) {
-            // 统计本批中实际完成投递的条数（低于等于新位点、且高于旧位点）
-            List<NormalizedRecord> confirmedRecords = new java.util.ArrayList<>();
-            for (NormalizedRecord r : batch) {
-                if (r.seq() <= toConfirm) {
-                    confirmedRecords.add(r);
-                }
-            }
-            listener.onConfirmedRecords(List.copyOf(confirmedRecords));
+            // 本批中实际完成投递的记录（由缓冲在确认时按位点精确给出）
+            List<NormalizedRecord> confirmedRecords = confirmResult.confirmed();
+            listener.onConfirmedRecords(confirmedRecords);
             listener.onConfirmed(toConfirm, confirmedRecords.size());
             // 成功且位点推进：若还有积压继续排空
             return true;

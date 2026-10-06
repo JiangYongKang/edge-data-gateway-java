@@ -35,6 +35,29 @@ import java.util.Map;
  */
 public final class SpoolBuffer {
 
+    /**
+     * 缓冲变更监听（在缓冲锁内回调）。
+     *
+     * <p>与缓冲联动的统计计数（accepted / delivered / droppedOldest /
+     * rejectedNewest）必须在这里更新：缓冲锁释放时统计与位点已同时生效，
+     * 核对器“视图→快照→视图”的切面因此不会被撕裂。锁序固定为
+     * 缓冲锁 → 统计锁，任何代码不得反向嵌套。
+     */
+    public interface MutationListener {
+        /** append 完成（接受 / 溢出丢弃 / 拒新），result 与 append 返回值一致。 */
+        void onAppend(AcceptResult result, NormalizedRecord record);
+
+        /** confirm 推进位点，confirmed 为本次新确认的记录（按 seq 升序）。 */
+        void onConfirm(long confirmedSeq, List<NormalizedRecord> confirmed);
+    }
+
+    /** confirm 的确定性结果：是否推进 + 本次新确认的记录明细。 */
+    public record ConfirmResult(boolean advanced, List<NormalizedRecord> confirmed) {
+        public ConfirmResult {
+            confirmed = List.copyOf(confirmed);
+        }
+    }
+
     private final BufferStateStore.JsonFile stateStore;
     private final Path walFile;
     private final Path walTmp;
@@ -47,6 +70,12 @@ public final class SpoolBuffer {
     private long nextSeq;
     private long confirmedSeq;
     private final Map<String, Long> lastTsByDevice = new LinkedHashMap<>();
+    private volatile MutationListener mutationListener;
+
+    /** 注册缓冲变更监听（最多一个；在启动恢复前注册）。 */
+    public void setMutationListener(MutationListener listener) {
+        this.mutationListener = listener;
+    }
 
     public SpoolBuffer(BufferStateStore.JsonFile stateStore,
                        Path walFile,
@@ -114,7 +143,9 @@ public final class SpoolBuffer {
                     // 新记录不入缓冲；seq 仍被消耗以保证全局单调、缺口可解释
                     nextSeq++;
                     persistState();
-                    return AcceptResult.rejectedNewest(candidate);
+                    AcceptResult rejected = AcceptResult.rejectedNewest(candidate);
+                    notifyAppend(rejected, candidate);
+                    return rejected;
                 }
                 // DROP_OLDEST：弹出最旧的未确认记录，直到腾出位置
                 dropped = new ArrayList<>();
@@ -140,28 +171,41 @@ public final class SpoolBuffer {
                 rewriteWal();
             }
             persistState();
-            return dropped.isEmpty() ? AcceptResult.ok(seq)
+            AcceptResult result = dropped.isEmpty() ? AcceptResult.ok(seq)
                     : AcceptResult.droppedOldest(seq, dropped);
+            notifyAppend(result, candidate);
+            return result;
         }
     }
 
     /** 确认位点推进。重复确认/回退确认返回 false 且不产生任何效果。 */
     public boolean confirm(long seq) {
+        return confirmWithRecords(seq).advanced();
+    }
+
+    /** 确认位点推进并返回本次新确认的记录明细（供逐设备送达统计与日志）。 */
+    public ConfirmResult confirmWithRecords(long seq) {
         synchronized (lock) {
             if (seq <= confirmedSeq) {
-                return false;
+                return new ConfirmResult(false, List.of());
             }
             if (seq >= nextSeq) {
                 // 不能确认尚未分配的位点
-                return false;
+                return new ConfirmResult(false, List.of());
             }
+            List<NormalizedRecord> confirmed = new ArrayList<>();
             while (!pending.isEmpty() && pending.peekFirst().seq() <= seq) {
-                pending.pollFirst();
+                confirmed.add(pending.pollFirst());
             }
             confirmedSeq = seq;
             rewriteWal();
             persistState();
-            return true;
+            ConfirmResult result = new ConfirmResult(true, confirmed);
+            MutationListener listener = mutationListener;
+            if (listener != null) {
+                listener.onConfirm(seq, result.confirmed());
+            }
+            return result;
         }
     }
 
@@ -208,6 +252,13 @@ public final class SpoolBuffer {
     }
 
     // ---- 持久化 ----
+
+    private void notifyAppend(AcceptResult result, NormalizedRecord record) {
+        MutationListener listener = mutationListener;
+        if (listener != null) {
+            listener.onAppend(result, record);
+        }
+    }
 
     private void persistState() {
         try {

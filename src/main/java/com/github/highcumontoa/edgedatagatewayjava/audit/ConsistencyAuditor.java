@@ -17,10 +17,12 @@ import java.util.Set;
  * 统计一致性核对器。
  *
  * <p>一致性切面：统计快照在单锁内生成，本身自洽；与缓冲联动的计数
- * （accepted / delivered / droppedOldest / rejectedNewest）只会在缓冲
- * append/confirm 之后变化，因此“读缓冲视图 → 读统计快照 → 再读缓冲视图，
- * 两次视图相等”即构成一个一致性切面。采集与补传并发进行时若切面不稳定
- * 就重试；超过限定次数返回 {@link AuditReport.Status#UNSTABLE}，
+ * （accepted / delivered / droppedOldest / rejectedNewest）由
+ * {@link SpoolBuffer.MutationListener} 在缓冲锁内与位点变更同时生效，
+ * 因此“读缓冲视图 → 读统计快照 → 再读缓冲视图，两次视图相等”即构成一个
+ * 一致性切面：切面稳定说明窗口内没有任何 append/confirm，统计联动计数
+ * 也未变化。采集与补传并发进行时若切面不稳定就重试；超过限定次数返回
+ * {@link AuditReport.Status#UNSTABLE}（当前无法判定），
  * 绝不把不同时间点的计数拼成一份自相矛盾的报告。
  *
  * <p>核对口径：

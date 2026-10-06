@@ -16,8 +16,12 @@ public interface CollectionListener {
     default void onInternalError(String deviceId, RawReading raw, Throwable error) {
     }
 
-    /** 归一化通过（record.seq 尚未分配，由缓冲分配；网关在此做每设备时间戳乱序判断）。 */
-    void onAccepted(String deviceId, RawReading raw, NormalizedRecord record);
+    /**
+     * 归一化通过（record.seq 尚未分配，由缓冲分配；网关在此做每设备时间戳乱序判断）。
+     *
+     * @return 网关侧的最终处置结果，采集线程据此计数，保证逐台与整体口径一致
+     */
+    AcceptOutcome onAccepted(String deviceId, RawReading raw, NormalizedRecord record);
 
     /** 归一化拒绝（带可区分原因）。 */
     void onRejected(String deviceId, RejectedReading rejected);

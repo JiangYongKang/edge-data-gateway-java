@@ -11,8 +11,8 @@
 ## 1. 构建与运行
 
 ```bash
-mvn test          # 33 个单测，覆盖断网重连、重复补传、畸形读数、缓冲溢出边界、
-                  # 健康分级、恢复观察、并发核对自洽、重启续算
+mvn test          # 37 个单测，覆盖断网重连、重复补传、畸形读数、缓冲溢出边界、
+                  # 健康分级、恢复观察、并发核对自洽、统计对账、重启续算
 mvn -q compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 java -cp "target/classes:$(cat target/cp.txt)" \
      com.github.highcumontoa.edgedatagatewayjava.demo.DemoRunner
@@ -33,7 +33,7 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 | `buffer` | `SpoolBuffer` / `AcceptResult` / `BufferStateStore` | 有界缓冲、WAL、seq 位点与溢出策略 |
 | `uplink` | `UplinkChannel` / `MockUplinkChannel` | 上行通道抽象与模拟（断网/重连、按 seq 幂等去重） |
 | `forward` | `ForwardWorker` | 单线程顺序补传，断网重试，重复投递/确认安全 |
-| `collect` | `CollectorSupervisor` | 每设备独立调度线程，异常隔离、在线状态与设备统计 |
+| `collect` | `CollectorSupervisor` / `AcceptOutcome` / `DeviceStats` | 每设备独立调度线程，异常隔离、在线状态；按网关处置结果计数，逐台与整体同口径 |
 | `stats` | `StatsRegistry` / `StatsSnapshot` / `DeviceCounters` / `DeviceStateStore` | 全局+逐设备计数（单锁自洽快照）、设备级状态持久化 |
 | `health` | `HealthMonitor` / `HealthState` / `DeviceHealth` | 设备健康分级状态机，只由真实轮询结果驱动 |
 | `audit` | `ConsistencyAuditor` / `AuditReport` | 运行中统计一致性核对，逐设备指出不一致类别 |
@@ -159,11 +159,40 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 发现不一致时，`violations` 逐条给出**哪台设备（全局关系为 null）、哪一类计数
 （`Category`）、期望值与实际值**，而不是笼统的失败结论。
 
-**自洽性边界**：统计快照在 `StatsRegistry` 单锁内生成，本身不会被并发写撕裂；
-与缓冲联动的计数只在缓冲 append/confirm 之后变化，因此核对器采用
-"读缓冲视图 → 读统计快照 → 再读缓冲视图，两次视图相等"的一致性切面。
-采集与补传并发进行时若切面不稳定会重试（最多 100 次）；极端持续写入下返回
-`UNSTABLE`——**绝不把不同时间点的计数拼成一份自相矛盾的报告**。
+### 7.1 逐台统计与整体统计的口径关系
+
+一条读数在任一计数体系里**要么算接受、要么算拒绝、要么算缓冲拒新，
+三选一且只算一次**，逐台与整体同口径：
+
+- 归一化拒绝与网关乱序拒绝（`TIMESTAMP_OUT_OF_ORDER`）都计入
+  `rejectedByReason`：逐台各原因之和 == 整体对应原因；
+- 通过全部校验并写入缓冲才计入 `accepted`：逐台之和 == 整体；
+- 缓冲满且 `REJECT_NEWEST` 时被拒的新记录计入 `rejectedNewest`（不占
+  `accepted`、不占 `rejectedByReason`）：逐台之和 == 整体；
+- 采集侧运行计数（`DeviceStats`）与统计登记处（`StatsRegistry` 逐设备
+  `DeviceCounters`）一一对应：`acceptedCount == accepted`、
+  `rejectedCount == ΣrejectedByReason`、`droppedNewestCount == rejectedNewest`。
+  关键在采集线程不预先计数，而是以网关 `onAccepted` 返回的处置结果
+  （`AcceptOutcome`）为准——乱序读数不会出现在"设备侧算接受、整体算拒绝"
+  的撕裂状态；
+- 重启续算时两侧衔接同一恢复基线（`StatsRegistry.restore` 恢复逐设备计数并
+  求和出全局；`CollectorSupervisor.restoreBaseline` 用同一基线初始化采集侧
+  运行计数），重启后逐台与整体不错位。
+
+### 7.2 并发下核对结论的判定边界
+
+- 统计快照在 `StatsRegistry` 单锁内生成，本身不会被并发写撕裂；
+- 与缓冲联动的计数（accepted / delivered / droppedOldest / rejectedNewest）
+  由 `SpoolBuffer.MutationListener` **在缓冲锁内**与位点变更同时生效
+  （锁序固定：缓冲锁 → 统计锁），因此缓冲锁释放的瞬间"统计 ↔ 缓冲位点"
+  必然互相吻合；
+- 核对器按"读缓冲视图 → 读统计快照 → 再读缓冲视图，两次视图相等"取一致性
+  切面：切面稳定即保证窗口内没有任何 append/confirm，统计联动计数也未变化，
+  此时给出的 `CONSISTENT` / `INCONSISTENT` 都是基于同一时刻的真实结论；
+- 切面不稳定就重试（最多 100 次，间隔 1ms）；采集与补传持续高频写入、
+  重试耗尽仍取不到稳定切面时返回 **`UNSTABLE`——即"当前无法判定"**，
+  报告里不带任何核对结论，绝不把不同时刻的数字拼成一份自相矛盾的报告。
+  `UNSTABLE` 是瞬时状态：写入停顿后再次核对即可得到确定结论。
 
 ## 8. 重启续算与兼容范围
 
@@ -177,7 +206,8 @@ DEGRADED → RECOVERING → HEALTHY 的完整健康切换）。结束时打印�
 - 落盘时机：每次健康状态切换、以及 `shutdown()` 时（临时文件 + 原子 rename）。
 - **优雅停机后重启**：健康状态（如 FAULT）、连续失败/成功次数、统计基线完整
   衔接，继续运行后 `audit()` 仍成立；全局计数由逐设备基线求和恢复，
-  "全局=逐设备之和"天然成立。
+  "全局=逐设备之和"天然成立；采集侧运行计数（DeviceStats）也用同一基线
+  初始化，重启后逐台与整体不错位。
 - **崩溃（非优雅停机）**：缓冲位点由 WAL 保证不丢不重；统计与健康状态回退到
   最近一次落盘（最后一次健康切换或上次优雅停机），可能丢失其后的计数增量——
   属于已声明边界，不会因此产生重复计数。
@@ -211,11 +241,14 @@ health(逐设备健康)`。核对结论通过 `EdgeGateway.audit()` 获取。
 | `GatewayIntegrationTest`（5） | 单设备异常不影响其它设备且统计如实、畸形+乱序读数原因可区分且脏值不到下游、断网溢出 DROP_OLDEST 端到端守恒、网关重启不重放已确认且 seq 连续、重启后乱序时间戳位点恢复 |
 | `HealthMonitorTest`（4） | 反复出错 HEALTHY→DEGRADED→FAULT 且切换原因/时间可查、恢复观察通过才回正常、观察期复发退回降级、重启恢复后续算不重新累计 |
 | `HealthAndAuditTest`（6） | 网关端到端：反复出错降级、上行中断不误判设备不健康、恢复观察期可观察、并发采集+断连+溢出下 300 次核对无自相矛盾、重启后健康与统计续算不重复计数、REJECT_NEWEST 序号守恒 |
+| `StatsReconciliationTest`（4） | 统计对账：乱序读数被拒后逐台与整体同口径（两侧都算拒绝）、REJECT_NEWEST 逐台拒新==整体拒新、并发采集+补传+断连+溢出下 400 次核对每份报告自洽（CONSISTENT 报告内部数字复核吻合，否则 UNSTABLE）、断网积压/溢出丢弃/乱序拒绝后重启续算再续跑全程对账成立 |
 
-测试日志中可直接看到 `[原始读数]`、`[归一化结果]`、`[补传位点]` 三类打印。
+测试日志中可直接看到 `[原始读数]`、`[归一化结果]`、`[补传位点]` 三类打印，
+`[对账]` 前缀的日志逐条给出每个用例覆盖的业务与对账结果。
 关键一致性断言：下游记录严格按 seq 升序且全局唯一；
 `已分配 seq 数 = 下游记录数 + 溢出丢弃数`；拒绝原因分项计数与注入的异常一一对应；
-逐设备 `errorCount/acceptedCount` 与故障/恢复剧本一致。
+逐设备 `acceptedCount/rejectedCount/droppedNewestCount` 与统计登记处逐设备计数
+逐项相等，且逐台之和等于整体。
 
 ## 11. 配置
 

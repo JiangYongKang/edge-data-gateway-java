@@ -5,6 +5,7 @@ import com.github.highcumontoa.edgedatagatewayjava.audit.ConsistencyAuditor;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.AcceptResult;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.BufferStateStore;
 import com.github.highcumontoa.edgedatagatewayjava.buffer.SpoolBuffer;
+import com.github.highcumontoa.edgedatagatewayjava.collect.AcceptOutcome;
 import com.github.highcumontoa.edgedatagatewayjava.collect.CollectionListener;
 import com.github.highcumontoa.edgedatagatewayjava.collect.CollectorSupervisor;
 import com.github.highcumontoa.edgedatagatewayjava.collect.DeviceStats;
@@ -48,6 +49,8 @@ import java.util.Map;
  *   <li>设备健康只由真实轮询结果驱动；上行中断不参与健康判定。</li>
  *   <li>统计与健康状态落盘（device-state.json），优雅停机后重启续算，
  *       不清零重算、不重复计数。</li>
+ *   <li>统计口径：一条读数接受/拒绝/拒新三选一只计一次，逐台与整体同口径；
+ *       与缓冲联动的计数在缓冲锁内更新，核对切面不被并发写撕裂。</li>
  * </ul>
  */
 public final class EdgeGateway implements CollectionListener, ForwardListener {
@@ -77,13 +80,35 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
                 dir.resolve("spool.wal"),
                 props.bufferCapacity(),
                 props.overflowPolicy());
+        this.stats = new StatsRegistry();
+        // 与缓冲联动的统计在缓冲锁内更新：缓冲锁释放时统计与位点已同时生效，
+        // 核对器的“视图→快照→视图”切面不会被并发写撕裂
+        buffer.setMutationListener(new SpoolBuffer.MutationListener() {
+            @Override
+            public void onAppend(AcceptResult result, NormalizedRecord record) {
+                if (result.accepted()) {
+                    stats.recordAccepted(record.deviceId());
+                    for (NormalizedRecord v : result.dropped()) {
+                        stats.recordDroppedOldest(v.deviceId(), 1);
+                    }
+                } else {
+                    stats.recordRejectedNewest(record.deviceId());
+                }
+            }
+
+            @Override
+            public void onConfirm(long confirmedSeq, List<NormalizedRecord> confirmed) {
+                for (NormalizedRecord r : confirmed) {
+                    stats.recordDelivered(r.deviceId());
+                }
+            }
+        });
         buffer.recover();
         log.info("buffer recovered: nextSeq={}, confirmedSeq={}, pending={}",
                 buffer.nextSeq(), buffer.confirmedSeq(), buffer.size());
 
         Map<String, PointDefinition> catalog = buildCatalog(devices);
         this.normalizer = new Normalizer(catalog);
-        this.stats = new StatsRegistry();
         this.health = new HealthMonitor(props.degradeAfterFailures(),
                 props.faultAfterFailures(), props.recoverAfterSuccesses());
 
@@ -108,6 +133,8 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
         this.auditor = new ConsistencyAuditor(stats, buffer);
         this.supervisor = new CollectorSupervisor(devices, normalizer, catalog, this,
                 props.collectIntervalMillis());
+        // 采集侧运行计数衔接同一恢复基线，重启后逐台统计与整体统计不错位
+        this.supervisor.restoreBaseline(persisted.counters().values().stream().toList());
         this.forwarder = new ForwardWorker(buffer, channel, this,
                 props.drainIntervalMillis(), props.batchSize());
     }
@@ -191,7 +218,7 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
     }
 
     @Override
-    public void onAccepted(String deviceId, RawReading raw, NormalizedRecord record) {
+    public AcceptOutcome onAccepted(String deviceId, RawReading raw, NormalizedRecord record) {
         Long lastTs = buffer.lastTimestamp(deviceId);
         if (lastTs != null && raw.timestamp() < lastTs) {
             RejectedReading rr = new RejectedReading(raw, RejectReason.TIMESTAMP_OUT_OF_ORDER,
@@ -199,33 +226,32 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
                             + " for device " + deviceId);
             stats.recordRejected(deviceId, RejectReason.TIMESTAMP_OUT_OF_ORDER);
             log.warn("[REJECT] raw={} reason={} detail={}", raw, rr.reason(), rr.detail());
-            return;
+            return AcceptOutcome.REJECTED_OUT_OF_ORDER;
         }
 
         AcceptResult result = buffer.append(record);
+        // accepted / droppedOldest / rejectedNewest 统计已在缓冲锁内由 MutationListener 更新
         if (!result.accepted()) {
             // REJECT_NEWEST：缓冲满，新记录被确定性拒绝；seq 已消耗，形成可解释缺口
-            stats.recordRejectedNewest(deviceId);
             log.warn("[BUFFER-FULL REJECT-NEWEST] raw={} normalized(seq={}) dropped, "
                             + "policy={}, capacity={}, confirmedSeq={}",
                     raw, result.seq(), props.overflowPolicy(), props.bufferCapacity(),
                     buffer.confirmedSeq());
-            return;
+            return AcceptOutcome.DROPPED_NEWEST;
         }
 
-        stats.recordAccepted(deviceId);
         NormalizedRecord stored = new NormalizedRecord(result.seq(), record.deviceId(),
                 record.pointId(), record.type(), record.value(), record.unit(), record.timestamp());
         log.info("[ACCEPT] raw={} -> normalized={}", raw, stored);
         if (!result.dropped().isEmpty()) {
             for (NormalizedRecord v : result.dropped()) {
-                stats.recordDroppedOldest(v.deviceId(), 1);
                 log.warn("[BUFFER-FULL DROP-OLDEST] evicted seq={} {}/{} ts={} "
                                 + "to make room for seq={}",
                         v.seq(), v.deviceId(), v.pointId(), v.timestamp(), result.seq());
             }
         }
         forwarder.kick();
+        return AcceptOutcome.ACCEPTED;
     }
 
     @Override
@@ -258,15 +284,9 @@ public final class EdgeGateway implements CollectionListener, ForwardListener {
 
     @Override
     public void onConfirmed(long confirmedSeq, int recordsThisBatch) {
+        // delivered 统计已在缓冲锁内由 MutationListener 更新
         log.info("[FORWARD] confirmedSeq={} (+{} records), nextSeq={}, pending={}",
                 confirmedSeq, recordsThisBatch, buffer.nextSeq(), buffer.size());
-    }
-
-    @Override
-    public void onConfirmedRecords(List<NormalizedRecord> confirmed) {
-        for (NormalizedRecord r : confirmed) {
-            stats.recordDelivered(r.deviceId());
-        }
     }
 
     @Override
